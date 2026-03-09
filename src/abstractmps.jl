@@ -5,7 +5,7 @@ using ITensors.Ops: Prod
 using ITensors.QuantumNumbers: QuantumNumbers, removeqn
 using ITensors.SiteTypes: SiteTypes, siteinds
 using ITensors.TagSets: TagSets
-
+using SparseBackends
 abstract type AbstractMPS end
 
 """
@@ -233,6 +233,15 @@ function setindex!(M::MPST, v::MPST, ::Colon) where {MPST <: AbstractMPS}
     setleftlim!(M, leftlim(v))
     setrightlim!(M, rightlim(v))
     data(M)[:] = data(v)
+    return M
+end
+
+function setindex!(M::AbstractMPS, T::SparseBackends.WrappedTensorTypes, n::Integer; set_limits::Bool=true)
+    if set_limits
+        (n <= leftlim(M)) && setleftlim!(M, n - 1)
+	(n >= rightlim(M)) && setrightlim!(M, n + 1)
+    end
+    data(M)[n] = T
     return M
 end
 

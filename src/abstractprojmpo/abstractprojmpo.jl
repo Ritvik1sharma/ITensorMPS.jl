@@ -1,4 +1,5 @@
 abstract type AbstractProjMPO end
+import SparseBackends
 
 copy(::AbstractProjMPO) = error("Not implemented")
 
@@ -175,8 +176,23 @@ function _makeR!(P::AbstractProjMPO, psi::MPS, k::Int)::Union{ITensor, Nothing}
     R = rproj(P)
     while rl > k
         R = R * psi[rl - 1] * P.H[rl - 1] * dag(prime(psi[rl - 1]))
-        P.LR[rl - 1] = R
-        rl -= 1
+        # println("The tensor here is R = ", R)
+        hamiltonian_dense = SparseBackends.dense(P.H[rl - 1])
+        R2 = psi[rl - 1] * hamiltonian_dense * dag(prime(psi[rl - 1]))
+        difference = R - R2
+        println("The difference between R and R2 is ", norm(difference))
+        error("The tensor R computed by multiplying the MPO tensor is \n$R\n but the tensor R2 computed by multiplying the dense version of the MPO tensor is \n$R2\n, they should be the same, so there is probably a bug in the multiplication of the MPO tensor in makeR!")
+        # println("========= ", rl)
+        # R = R * P.H[rl - 1]
+        # R = R * psi[rl - 1]
+        # println("========= ", rl, " after multiplying H: ", R)
+        # R = R * P.H[rl - 1]
+        # println("========= ", rl, " after multiplying psi: ", R)
+        # R = R * dag(prime(psi[rl - 1]))
+        # println("========= ", rl, " after multiplying dag psi: ", R)
+        # R = R * psi[rl - 1] * P.H[rl - 1] * dag(prime(psi[rl - 1]))
+        # P.LR[rl - 1] = R
+        # rl -= 1
     end
     P.rpos = k
     return R

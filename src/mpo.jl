@@ -3,6 +3,7 @@ using LinearAlgebra: dot
 using Random: Random
 using ITensors.Ops: OpSum
 using ITensors.SiteTypes: SiteTypes, siteind, siteinds
+using SparseBackends
 
 """
     MPO
@@ -19,6 +20,102 @@ end
 function MPO(A::Vector{<:ITensor}; ortho_lims::UnitRange = 1:length(A))
     return MPO(A, first(ortho_lims) - 1, last(ortho_lims) + 1)
 end
+
+# function collapse_all_bonds!(W::MPO; debug::Bool=false)
+#   N = length(W)
+#   for b in 1:(N - 1)
+#     T1 = W[b]
+#     T2 = W[b + 1]
+#     L = [i for i in commoninds(T1, T2) if hastags(i, "Link")]
+
+#     if length(L) ≥ 2 || (length(L) == 1 && dim(L[1]) == 1)
+#       C = combiner(L...; tags=("Link,l=$(b)"))
+#       W[b]     = T1 * C
+#       W[b + 1] = dag(C) * T2
+#     end
+#   end
+
+#   for endidx in (1, N)
+#     Tend = W[endidx]
+#     Lend = [i for i in inds(Tend) if hastags(i, "Link")]
+#     if length(Lend) ≥ 2
+#       C = combiner(Lend...; tags=("Link,l=$(endidx == 1 ? 1 : N-1)"))
+#       W[endidx] = Tend * C
+#     elseif length(Lend) == 1 && dim(Lend[1]) == 1
+#       C = combiner(Lend[1]; tags=("Link,l=$(endidx == 1 ? 1 : N-1)"))
+#       W[endidx] = Tend * C
+#     end
+#   end
+#   return W
+# end
+
+
+function bond_common_links(T1, T2, b)
+  return [I for I in ITensors.commoninds(T1, T2)
+          if ITensors.hastags(I,"Link") && ITensors.hastags(I,"l=$b")]
+end
+
+function noprime_links(T::ITensor)
+  link_is = [I for I in inds(T) if hastags(I, "Link") && plev(I) != 0]
+  isempty(link_is) && return T
+  # Map each primed link index to an unprimed version *of itself*
+  # (same id? no, prime level differs, ITensors tracks this via prime)
+  return replaceinds(T, link_is .=> (noprime.(link_is)))
+end
+
+function collapse_all_bonds!(W::MPO; debug::Bool=false)
+  N = length(W)
+
+  for b in 1:(N - 1)
+    T1 = W[b]
+    T2 = W[b + 1]
+
+    # Actual shared link indices (can be primed)
+    L = bond_common_links(T1, T2, b)
+    length(L) ≤ 1 && continue
+
+    debug && println("b=$b, common link inds: ", L)
+
+    # Build combiner on unprimed versions, then relabel legs to the actual primed ones.
+    Lu = ITensors.noprime.(L)
+    C0 = ITensors.combiner(Lu...; tags=("Link,l=$b"))
+    C  = ITensors.replaceinds(C0, Lu .=> L)
+
+    # Combine into the left tensor (contracts L...; leaves only combined index)
+    T1c = T1 * C
+
+    # Push inverse into the right tensor.
+    # dag(C) has primed versions of (combined, L...) typically; make its L-legs match T2 exactly.
+    U0 = ITensors.dag(C)
+
+    # Identify the link legs of U0 that correspond to the uncombined legs.
+    # Since C indices are (combined, L...), U0 indices are (combined', L'...) in some order;
+    # easiest is to map based on unprimed identity:
+    Uinds = collect(ITensors.inds(U0))
+    # Build mapping for each L leg: find matching leg in U0 by comparing noprime() equality.
+    from = ITensors.Index[]
+    to   = ITensors.Index[]
+    for Li in L
+      target = Li                         # must match T2 exactly
+      key    = ITensors.noprime(Li)
+      j = findfirst(I -> (ITensors.hastags(I, "Link") &&
+                          ITensors.hastags(I, "l=$b") &&
+                          ITensors.noprime(I) == key), Uinds)
+      j === nothing && continue
+      push!(from, Uinds[j])
+      push!(to, target)
+    end
+    U = isempty(from) ? U0 : ITensors.replaceinds(U0, from .=> to)
+
+    T2c = U * T2
+
+    W[b]   = T1c
+    W[b+1] = T2c
+  end
+
+  return W
+end
+
 
 set_data(A::MPO, data::Vector{ITensor}) = MPO(data, A.llim, A.rlim)
 
@@ -602,6 +699,7 @@ function apply(A::MPO, ψ::MPS; alg = Algorithm"densitymatrix"(), kwargs...)
 end
 
 function apply(alg::Algorithm, A::MPO, ψ::MPS; kwargs...)
+    println("mpo Apply")
     Aψ = contract(alg, A, ψ; kwargs...)
     return replaceprime(Aψ, 1 => 0)
 end
@@ -613,6 +711,7 @@ function Apply(A::MPO, ψ::MPS; kwargs...)
 end
 
 function ITensors.contract(A::MPO, ψ::MPS; alg = nothing, method = alg, kwargs...)
+    println("mpo contract with alg")
     # TODO: Delete `method` since it is deprecated.
     alg = NDTensors.replace_nothing(method, "densitymatrix")
 
@@ -699,6 +798,7 @@ function ITensors.contract(
         normalize = false,
         kwargs...,
     )::MPS
+    println("mpo contract with densitymatrix")
     n = length(A)
     n != length(ψ) &&
         throw(DimensionMismatch("lengths of MPO ($n) and MPS ($(length(ψ))) do not match"))
@@ -777,6 +877,7 @@ function ITensors.contract(
 end
 
 function _contract(::Algorithm"naive", A, ψ; truncate = true, kwargs...)
+    
     A = sim(linkinds, A)
     ψ = sim(linkinds, ψ)
 
@@ -820,64 +921,227 @@ function ITensors.contract(alg::Algorithm"naive", A::MPO, B::MPO; kwargs...)
     return _contract(alg, A, B; kwargs...)
 end
 
-function ITensors.contract(
-        ::Algorithm"zipup",
-        A::MPO,
-        B::MPO;
-        cutoff = 1.0e-14,
-        maxdim = maxlinkdim(A) * maxlinkdim(B),
-        mindim = 1,
-        kwargs...,
+
+# function ITensors.contract(A::MPO, B::MPO,
+#                   Abackend::Symbol, Bbackend::Symbol;
+#                   denseLinksA::Union{Nothing,Int}=nothing,
+#                   denseLinksB::Union{Nothing,Int}=nothing,
+#                   cutoff=1e-14,
+#                   maxdim=maxlinkdim(A) * maxlinkdim(B),
+#                   debug::Bool=false,
+#                   kwargs...)
+#   N = length(A)
+#   N == length(B) || throw(DimensionMismatch("MPO lengths don't match"))
+
+#   # You still need to make sure they don't share both site indices per site.
+#   # Mimic ITensors behavior: if same siteinds, tell user to prime one side.
+#   sA = collect(ITensors.siteinds(A))
+#   sB = collect(ITensors.siteinds(B))
+#   if ITensors.hassameinds(sA, sB)
+#     error("A and B have the same site indices; prime one MPO (e.g. Bp = prime(B, \"Site\")) then contract and replaceprime.")
+#   end
+#   C = MPO(N)
+#   for i in 1:N
+#     println("Contracting site $i / $N")
+#     # Your existing ITensor-level glue does the backend conversion:
+#     C[i] = SparseBackends.contract(A[i], B[i], Abackend, Bbackend;
+#                     denseLinksA=denseLinksA, denseLinksB=denseLinksB)
+#   end
+#   return C
+# end
+
+# function _mpo_bond_link(W::MPO, i::Int, j::Int)
+#   common = commoninds(W[i], W[j])
+#   links = Index[]
+#   for I in common
+#     ITensors.hastags(I, "Link") && push!(links, I)
+#   end
+#   length(links) == 1 || error("Expected exactly 1 Link index between sites $i and $j, got $(length(links)).")
+#   return links[1]
+# end
+
+function _mpo_bond_links(W::MPO, i::Int, j::Int)
+    common = commoninds(W[i], W[j])
+    links = [I for I in common if ITensors.hastags(I, "Link")]
+    isempty(links) && error("No Link indices between sites $i and $j.")
+    return links
+end
+
+function ITensors.contract(A::MPO, B::MPO,
+                           Abackend::Symbol, Bbackend::Symbol;
+                           denseLinksA::Union{Nothing,Int}=nothing,
+                           denseLinksB::Union{Nothing,Int}=nothing,
+                           kwargs...)
+  #   println("=================== backends ", Abackend, " and ", Bbackend, " ===================")
+  N = length(A)
+  N == length(B) || throw(DimensionMismatch("MPO lengths don't match"))
+  sA = collect(siteinds(A))
+  sB = collect(siteinds(B))
+  if hassameinds(sA, sB)
+    error("A and B have the same site indices; prime one MPO (e.g. Bp = prime(B, \"Site\")) then contract and replaceprime.")
+  end
+  # bondmap: (aBond, bBond) -> cBond
+  bondmap = SparseBackends.BondMap()
+  C = MPO(N)
+  for i in 1:N
+    # println("abstractmps.jl: Contracting site $i / $N")
+    aLeft  = (i == 1) ? ITensors.Index[] : _mpo_bond_links(A, i-1, i)
+    aRight = (i == N) ? ITensors.Index[] : _mpo_bond_links(A, i,   i+1)
+    bLeft  = (i == 1) ? ITensors.Index[] : _mpo_bond_links(B, i-1, i)
+    bRight = (i == N) ? ITensors.Index[] : _mpo_bond_links(B, i,   i+1)
+    Ci, bondmap = SparseBackends.contract_and_fuse_links(
+      A[i], B[i], Abackend, Bbackend, bondmap;
+      denseLinksA=denseLinksA,
+      denseLinksB=denseLinksB,
+      aLeft=aLeft, aRight=aRight,
+      bLeft=bLeft, bRight=bRight
     )
-    if hassameinds(siteinds, A, B)
-        error(
-            "In `contract(A::MPO, B::MPO)`, MPOs A and B have the same site indices. The indices of the MPOs in the contraction are taken literally, and therefore they should only share one site index per site so the contraction results in an MPO. You may want to use `replaceprime(contract(A', B), 2 => 1)` or `apply(A, B)` which automatically adjusts the prime levels assuming the input MPOs have pairs of primed and unprimed indices.",
-        )
-    end
-    N = length(A)
-    N != length(B) &&
-        throw(DimensionMismatch("lengths of MPOs A ($N) and B ($(length(B))) do not match"))
-    # Special case for a single site
-    N == 1 && return MPO([A[1] * B[1]])
+    C[i] = Ci
+  end
+  return C
+end
+
+
+function ITensors.contract(
+  ::Algorithm"zipup",
+  A::MPO,
+  B::MPO;
+  is_ctn_compression::Bool=false,
+  debug::Bool=false,
+  cutoff=1e-14,
+  maxdim=maxlinkdim(A) * maxlinkdim(B),
+  mindim=1,
+  kwargs...,
+)
+  if hassameinds(siteinds, A, B)
+    error(
+      "In `contract(A::MPO, B::MPO)`, MPOs A and B have the same site indices. The indices of the MPOs in the contraction are taken literally, and therefore they should only share one site index per site so the contraction results in an MPO. You may want to use `replaceprime(contract(A', B), 2 => 1)` or `apply(A, B)` which automatically adjusts the prime levels assuming the input MPOs have pairs of primed and unprimed indices.",
+    )
+  end
+
+  N = length(A)
+  N != length(B) &&
+    throw(DimensionMismatch("lengths of MPOs A ($N) and B ($(length(B))) do not match"))
+  # Special case for a single site
+  N == 1 && return MPO([A[1] * B[1]])
+
+  if is_ctn_compression === false
     A = orthogonalize(A, 1)
     B = orthogonalize(B, 1)
-    A = sim(linkinds, A)
-    sA = siteinds(uniqueinds, A, B)
-    sB = siteinds(uniqueinds, B, A)
-    C = MPO(N)
-    lCᵢ = Index[]
-    R = ITensor(true)
-    for i in 1:(N - 2)
-        RABᵢ = R * A[i] * B[i]
-        left_inds = [sA[i]..., sB[i]..., lCᵢ...]
-        C[i], R = factorize(
-            RABᵢ,
-            left_inds;
-            ortho = "left",
-            tags = commontags(linkinds(A, i)),
-            cutoff,
-            maxdim,
-            mindim,
-            kwargs...,
-        )
-        lCᵢ = dag(commoninds(C[i], R))
-    end
-    i = N - 1
-    RABᵢ = R * A[i] * B[i] * A[i + 1] * B[i + 1]
-    left_inds = [sA[i]..., sB[i]..., lCᵢ...]
-    C[N - 1], C[N] = factorize(
+  end
+
+  A = sim(linkinds, A)
+  sA = siteinds(uniqueinds, A, B)
+  sB = siteinds(uniqueinds, B, A)
+  C = MPO(N)
+  lCᵢ = Index[]
+  R = ITensor(true)
+  for i in 1:(N - 2)
+    RABᵢ = R * A[i] * B[i]    
+    if is_ctn_compression === false
+      left_inds = [sA[i]..., sB[i]..., lCᵢ...]
+      C[i], R = factorize(
         RABᵢ,
         left_inds;
-        ortho = "right",
-        tags = commontags(linkinds(A, i)),
+        ortho="left",
+        tags=commontags(linkinds(A, i)),
         cutoff,
         maxdim,
         mindim,
         kwargs...,
+      )
+      lCᵢ = dag(commoninds(C[i], R))
+    else
+      C[i] = RABᵢ
+    end
+  end
+
+  i = N - 1
+  if is_ctn_compression === false
+    RABᵢ = R * A[i] * B[i] * A[i + 1] * B[i + 1]
+    left_inds = [sA[i]..., sB[i]..., lCᵢ...]
+    C[N - 1], C[N] = factorize(
+      RABᵢ,
+      left_inds;
+      ortho="right",
+      tags=commontags(linkinds(A, i)),
+      cutoff,
+      maxdim,
+      mindim,
+      kwargs...,
     )
+    lCᵢ = dag(commoninds(C[i], R))
+  else
+    C[i] = R * A[i] * B[i]
+    C[i+1] = A[i + 1] * B[i + 1]
+  end
+  if is_ctn_compression === false
     truncate!(C; kwargs...)
-    return C
+  else
+    collapse_all_bonds!(C; debug=debug)
+  end
+  return C
 end
+
+# function ITensors.contract(
+#         ::Algorithm"zipup",
+#         A::MPO,
+#         B::MPO;
+#         cutoff = 1.0e-14,
+#         maxdim = maxlinkdim(A) * maxlinkdim(B),
+#         mindim = 1,
+#         kwargs...,
+#     )
+#     println("mpo contract with zipup  ")
+#     if hassameinds(siteinds, A, B)
+#         error(
+#             "In `contract(A::MPO, B::MPO)`, MPOs A and B have the same site indices. The indices of the MPOs in the contraction are taken literally, and therefore they should only share one site index per site so the contraction results in an MPO. You may want to use `replaceprime(contract(A', B), 2 => 1)` or `apply(A, B)` which automatically adjusts the prime levels assuming the input MPOs have pairs of primed and unprimed indices.",
+#         )
+#     end
+#     N = length(A)
+#     N != length(B) &&
+#         throw(DimensionMismatch("lengths of MPOs A ($N) and B ($(length(B))) do not match"))
+#     # Special case for a single site
+#     N == 1 && return MPO([A[1] * B[1]])
+#     A = orthogonalize(A, 1)
+#     B = orthogonalize(B, 1)
+#     A = sim(linkinds, A)
+#     sA = siteinds(uniqueinds, A, B)
+#     sB = siteinds(uniqueinds, B, A)
+#     C = MPO(N)
+#     lCᵢ = Index[]
+#     R = ITensor(true)
+#     for i in 1:(N - 2)
+#         RABᵢ = R * A[i] * B[i]
+#         left_inds = [sA[i]..., sB[i]..., lCᵢ...]
+#         C[i], R = factorize(
+#             RABᵢ,
+#             left_inds;
+#             ortho = "left",
+#             tags = commontags(linkinds(A, i)),
+#             cutoff,
+#             maxdim,
+#             mindim,
+#             kwargs...,
+#         )
+#         lCᵢ = dag(commoninds(C[i], R))
+#     end
+#     i = N - 1
+#     RABᵢ = R * A[i] * B[i] * A[i + 1] * B[i + 1]
+#     left_inds = [sA[i]..., sB[i]..., lCᵢ...]
+#     C[N - 1], C[N] = factorize(
+#         RABᵢ,
+#         left_inds;
+#         ortho = "right",
+#         tags = commontags(linkinds(A, i)),
+#         cutoff,
+#         maxdim,
+#         mindim,
+#         kwargs...,
+#     )
+#     truncate!(C; kwargs...)
+#     return C
+# end
 
 """
     apply(A::MPO, B::MPO; kwargs...)
