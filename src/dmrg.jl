@@ -405,9 +405,9 @@ function dmrg(
     #   println("diff vbetween last energy and energy is ", last_energy - energy)
     # end
     early_exit_sweep = sw
-    if use_early_exit && (last_energy - energy < 1e-8)
+    if use_early_exit && (last_energy - energy < 1e-4)
       if outputlevel >= 1
-        println("Energy change less than 1e-8, stopping DMRG")
+        println("Energy change less than 1e-4, stopping DMRG")
       end
       break
     end
@@ -418,7 +418,7 @@ function dmrg(
     # if target_energy != nothing
     #   println("diff vbetween energy abnd target energy is ", energy - target_energy)
     # end
-    if target_energy != nothing && (energy - target_energy) < 1e-4
+    if target_energy !== nothing && (energy - target_energy) < 1e-4
       println("Target energy reached in sweeps ", sw)
       break
     end
