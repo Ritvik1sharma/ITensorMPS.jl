@@ -699,7 +699,6 @@ function ITensors.contract(
         normalize = false,
         kwargs...,
     )::MPS
-    println("MPO MPS contraction")
     n = length(A)
     n != length(ψ) &&
         throw(DimensionMismatch("lengths of MPO ($n) and MPS ($(length(ψ))) do not match"))
