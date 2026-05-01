@@ -5,7 +5,7 @@ using ITensors.Ops: Prod
 using ITensors.QuantumNumbers: QuantumNumbers, removeqn
 using ITensors.SiteTypes: SiteTypes, siteinds
 using ITensors.TagSets: TagSets
-
+using SparseBackends
 abstract type AbstractMPS end
 
 """
@@ -233,6 +233,15 @@ function setindex!(M::MPST, v::MPST, ::Colon) where {MPST <: AbstractMPS}
     setleftlim!(M, leftlim(v))
     setrightlim!(M, rightlim(v))
     data(M)[:] = data(v)
+    return M
+end
+
+function setindex!(M::AbstractMPS, T::SparseBackends.WrappedTensorTypes, n::Integer; set_limits::Bool=true)
+    if set_limits
+        (n <= leftlim(M)) && setleftlim!(M, n - 1)
+	(n >= rightlim(M)) && setrightlim!(M, n + 1)
+    end
+    data(M)[n] = T
     return M
 end
 
@@ -1610,16 +1619,23 @@ function orthogonalize!(M::AbstractMPS, j::Int; maxdim = nothing, normalize = no
     while leftlim(M) < (j - 1)
         (leftlim(M) < 0) && setleftlim!(M, 0)
         b = leftlim(M) + 1
-        linds = uniqueinds(M[b], M[b + 1])
         lb = linkind(M, b)
-        if !isnothing(lb)
-            ltags = tags(lb)
+        ltags = !isnothing(lb) ? tags(lb) : TagSet("Link,l=$b")
+        if ITensors.has_external_storage(M[b])
+            # Sparse site: densify for factorize, then absorb R into the next sparse site.
+            # L (small isometry) is kept dense; R * M[b+1] stays WrappedBlockSparse
+            # via the existing sparse×dense contract dispatch.
+            A = SparseBackends.to_dense_itensors(M[b])
+            linds = uniqueinds(A, M[b + 1])
+            L, R = factorize(A, linds; tags = ltags, maxdim)
+            M[b]     = L
+            M[b + 1] = R * M[b + 1]
         else
-            ltags = TagSet("Link,l=$b")
+            linds = uniqueinds(M[b], M[b + 1])
+            L, R = factorize(M[b], linds; tags = ltags, maxdim)
+            M[b]     = L
+            M[b + 1] *= R
         end
-        L, R = factorize(M[b], linds; tags = ltags, maxdim)
-        M[b] = L
-        M[b + 1] *= R
         setleftlim!(M, b)
         if rightlim(M) < leftlim(M) + 2
             setrightlim!(M, leftlim(M) + 2)
@@ -1631,17 +1647,23 @@ function orthogonalize!(M::AbstractMPS, j::Int; maxdim = nothing, normalize = no
     while rightlim(M) > (j + 1)
         (rightlim(M) > (N + 1)) && setrightlim!(M, N + 1)
         b = rightlim(M) - 2
-        rinds = uniqueinds(M[b + 1], M[b])
         lb = linkind(M, b)
-        if !isnothing(lb)
-            ltags = tags(lb)
+        ltags = !isnothing(lb) ? tags(lb) : TagSet("Link,l=$b")
+        if ITensors.has_external_storage(M[b + 1])
+            # Sparse site: densify for factorize, then absorb R into the previous sparse site.
+            # L (small isometry) is kept dense; M[b] * R stays WrappedBlockSparse
+            # via the existing sparse×dense contract dispatch.
+            A = SparseBackends.to_dense_itensors(M[b + 1])
+            rinds = uniqueinds(A, M[b])
+            L, R = factorize(A, rinds; tags = ltags, maxdim)
+            M[b + 1] = L
+            M[b]    *= R
         else
-            ltags = TagSet("Link,l=$b")
+            rinds = uniqueinds(M[b + 1], M[b])
+            L, R = factorize(M[b + 1], rinds; tags = ltags, maxdim)
+            M[b + 1] = L
+            M[b]    *= R
         end
-        L, R = factorize(M[b + 1], rinds; tags = ltags, maxdim)
-        M[b + 1] = L
-        M[b] *= R
-
         setrightlim!(M, b + 1)
         if leftlim(M) > rightlim(M) - 2
             setleftlim!(M, rightlim(M) - 2)

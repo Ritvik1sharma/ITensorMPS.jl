@@ -1,4 +1,5 @@
 abstract type AbstractProjMPO end
+import SparseBackends
 
 copy(::AbstractProjMPO) = error("Not implemented")
 
@@ -35,19 +36,38 @@ end
 
 function ITensors.contract(P::AbstractProjMPO, v::ITensor)::ITensor
     itensor_map = Union{ITensor, OneITensor}[lproj(P)]
+    
     append!(itensor_map, P.H[site_range(P)])
+    # for j in site_range(P)
+    #     if ITensors.has_external_storage(P.H[j])
+    #         # println("starting and ending inds ", inds(P.H[j]), " and ", ITensors.has_external_storage(P.H[j]))
+    #         tensor = SparseBackends.to_dense_itensors(P.H[j])
+    #         # println("starting and ending inds ", inds(tensor), " and ", ITensors.has_external_storage(tensor))        
+    #         push!(itensor_map, tensor)
+    #     else
+    #         push!(itensor_map, P.H[j])
+    #     end
+    #     # dense_h = SparseBackends.to_dense(P.H[j])
+    #     # push!(itensor_map, dense_h)
+    # end
+
     push!(itensor_map, rproj(P))
 
-    # Reverse the contraction order of the map if
-    # the first tensor is a scalar (for example we
-    # are at the left edge of the system)
+    # # Reverse the contraction order of the map if
+    # # the first tensor is a scalar (for example we
+    # # are at the left edge of the system)
     if dim(first(itensor_map)) == 1
         reverse!(itensor_map)
     end
+    idx = 0
 
     # Apply the map
     Hv = v
     for it in itensor_map
+        idx += 1
+        # println("Contracting with itensor ", idx, " inds are ", inds(it), " and v inds are ", inds(Hv))
+        # println("Contracting with itensor: ", it)
+        # println("Hv before contraction: ", Hv)
         Hv *= it
     end
     return Hv
@@ -129,7 +149,8 @@ function Base.size(P::AbstractProjMPO)::Tuple{Int, Int}
     return (d, d)
 end
 
-function _makeL!(P::AbstractProjMPO, psi::MPS, k::Int)::Union{ITensor, Nothing}
+function _makeL!(P::AbstractProjMPO, psi::MPS, k::Int; debug=false)::Union{ITensor, Nothing}
+    # println("\t\tPositioning ProjMPO ", debug)
     # Save the last `L` that is made to help with caching
     # for DiskProjMPO
     ll = P.lpos
@@ -144,7 +165,22 @@ function _makeL!(P::AbstractProjMPO, psi::MPS, k::Int)::Union{ITensor, Nothing}
     ll = max(ll, 0)
     L = lproj(P)
     while ll < k
-        L = L * psi[ll + 1] * P.H[ll + 1] * dag(prime(psi[ll + 1]))
+        if debug
+            L = L * P.H[ll + 1]
+            println("========= ", ll + 1, " after multiplying H: ", ITensors.has_external_storage(P.H[ll + 1]))
+            L = L * dag(prime(psi[ll + 1]))
+            println("========= ", ll + 1, " after multiplying dag prime psi: ", ITensors.has_external_storage(L))
+            L = L * psi[ll + 1]
+            println("========= ", ll + 1, " after multiplying psi: ", ITensors.has_external_storage(L))
+        else
+            H_site = P.H[ll + 1]
+            # if ITensors.has_external_storage(H_site)
+            #     H_site = SparseBackends.to_dense_itensors(H_site)
+            # end
+            L = L * H_site
+            L = L * dag(prime(psi[ll + 1]))
+            L = L * psi[ll + 1]
+        end
         P.LR[ll + 1] = L
         ll += 1
     end
@@ -153,12 +189,13 @@ function _makeL!(P::AbstractProjMPO, psi::MPS, k::Int)::Union{ITensor, Nothing}
     return L
 end
 
-function makeL!(P::AbstractProjMPO, psi::MPS, k::Int)
-    _makeL!(P, psi, k)
+function makeL!(P::AbstractProjMPO, psi::MPS, k::Int; debug=false)
+    # println("\tPositioning ProjMPO ", debug)
+    _makeL!(P, psi, k; debug=debug)
     return P
 end
 
-function _makeR!(P::AbstractProjMPO, psi::MPS, k::Int)::Union{ITensor, Nothing}
+function _makeR!(P::AbstractProjMPO, psi::MPS, k::Int; debug=false)::Union{ITensor, Nothing}
     # Save the last `R` that is made to help with caching
     # for DiskProjMPO
     rl = P.rpos
@@ -174,16 +211,40 @@ function _makeR!(P::AbstractProjMPO, psi::MPS, k::Int)::Union{ITensor, Nothing}
     rl = min(rl, N + 1)
     R = rproj(P)
     while rl > k
-        R = R * psi[rl - 1] * P.H[rl - 1] * dag(prime(psi[rl - 1]))
+        if debug
+            println("========= ", rl, N+1)
+            time = @elapsed begin
+                R = R * P.H[rl - 1]
+            end
+            println("========= ", " after multiplying H: ", R)
+            time = @elapsed begin
+                R =  dag(prime(psi[rl - 1])) * R
+            end
+            println("========= ", " after multiplying psi: ", R)
+            time = @elapsed begin
+                R = psi[rl - 1] * R
+            end
+            println("========= ", " after multiplying dag psi: ", R)
+        else
+            H_site = P.H[rl - 1]
+            # if ITensors.has_external_storage(H_site)
+            #     H_site = SparseBackends.to_dense_itensors(H_site)
+            # end
+            R = R * H_site
+            R = dag(prime(psi[rl - 1])) * R
+            R = psi[rl - 1] * R
+        end
         P.LR[rl - 1] = R
+        # println(" check rl - 1 information ", rl - 1)
+        # println("TENSOR IS ", R)
         rl -= 1
     end
     P.rpos = k
     return R
 end
 
-function makeR!(P::AbstractProjMPO, psi::MPS, k::Int)
-    _makeR!(P, psi, k)
+function makeR!(P::AbstractProjMPO, psi::MPS, k::Int; debug=false)
+    _makeR!(P, psi, k; debug=debug)
     return P
 end
 
@@ -199,9 +260,10 @@ The MPS `psi` must have compatible bond indices with
 the previous projected MPO tensors for this
 operation to succeed.
 """
-function position!(P::AbstractProjMPO, psi::MPS, pos::Int)
-    makeL!(P, psi, pos - 1)
-    makeR!(P, psi, pos + nsite(P))
+function position!(P::AbstractProjMPO, psi::MPS, pos::Int; debug=false)
+    # println("Positioning ProjMPO ", debug)
+    makeL!(P, psi, pos - 1; debug=debug)
+    makeR!(P, psi, pos + nsite(P); debug=debug)
     return P
 end
 
