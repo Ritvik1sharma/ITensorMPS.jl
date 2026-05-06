@@ -630,6 +630,15 @@ function dmrg(
             end
           end
 
+          # println("Starting eigsolve at sweep $sw, half $ha, bond ($b, $(b+1))")
+          # if ITensors.has_external_storage(phi)
+          #   println("Phi has inds ", inds(phi))
+          #   println("external storage information: has_external_storage(phi)=$(ITensors.has_external_storage(phi))")
+          #   println("  storage type: ", typeof(phi), phi)
+          #   println("  unwrapped storage type: ", psi[b])
+          #   println(" unwrapped storage type: ", psi[b+1])
+          # end
+
           # println("eigsolve at sweep $sw, half $ha, bond ($b, $(b+1))")
           time = @elapsed begin
             @timeit_debug timer "dmrg: eigsolve" begin
@@ -710,6 +719,8 @@ function dmrg(
               )
             end
           end
+
+          # println("================ print here ================ ", ITensors.has_external_storage(phi))
 
           maxtruncerr = max(maxtruncerr, spec.truncerr)
 

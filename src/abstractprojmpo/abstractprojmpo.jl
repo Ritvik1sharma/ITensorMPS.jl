@@ -53,10 +53,19 @@ function ITensors.contract(P::AbstractProjMPO, v::ITensor)::ITensor
 
     push!(itensor_map, rproj(P))
 
-    # # Reverse the contraction order of the map if
-    # # the first tensor is a scalar (for example we
-    # # are at the left edge of the system)
-    if dim(first(itensor_map)) == 1
+    # Reverse the contraction order of the map if
+    # the first tensor is a scalar (for example we
+    # are at the left edge of the system)
+    first_t = first(itensor_map)
+    comp = if first_t isa OneITensor
+        1
+    elseif ITensors.has_external_storage(first_t)
+        prod(SparseBackends._dims(ITensors.get_external_storage(first_t)))
+    else
+        dim(first_t)
+    end
+
+    if comp == 1
         reverse!(itensor_map)
     end
     idx = 0
@@ -178,7 +187,27 @@ function _makeL!(P::AbstractProjMPO, psi::MPS, k::Int; debug=false)::Union{ITens
             #     H_site = SparseBackends.to_dense_itensors(H_site)
             # end
             L = L * H_site
-            L = L * dag(prime(psi[ll + 1]))
+            try
+                L = L * dag(prime(psi[ll + 1]))
+            catch e
+                println("Error at position ll = ", ll)
+                println("ll + 1 = ", ll + 1)
+                println("\n--- Tensor L ---")
+                println(L)
+                println("inds(L) = ", inds(L))
+                println("\n--- psi[ll + 1] ---")
+                println(psi[ll + 1])
+                println("inds(psi[ll + 1]) = ", inds(psi[ll + 1]))
+                println("\n--- prime(psi[ll + 1]) ---")
+                println(prime(psi[ll + 1]))
+                println("inds(prime(psi[ll + 1])) = ", inds(prime(psi[ll + 1])))
+                println("\n--- dag(prime(psi[ll + 1])) ---")
+                println(dag(prime(psi[ll + 1])))
+                println("inds(dag(prime(psi[ll + 1]))) = ", inds(dag(prime(psi[ll + 1]))))
+                println("\n--- Error ---")
+                rethrow(e)
+            end
+            # L = L * dag(prime(psi[ll + 1]))
             L = L * psi[ll + 1]
         end
         P.LR[ll + 1] = L

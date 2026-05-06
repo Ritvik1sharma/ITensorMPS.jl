@@ -873,7 +873,6 @@ function ITensors.contract(
         aRight = (i == n) ? ITensors.Index[] : _mpo_bond_links(A, i,   i+1)
         bLeft  = (i == 1) ? ITensors.Index[] : _mps_bond_links(ψ, i-1, i)
         bRight = (i == n) ? ITensors.Index[] : _mps_bond_links(ψ, i,   i+1)
-        println("inds are ", inds(A[i]), " and ", inds(ψ[i]))
         Ci, bondmap = SparseBackends.contract_and_fuse_links(
         A[i], ψ[i], Abackend, Bbackend, bondmap;
         denseLinksA=denseLinksA,

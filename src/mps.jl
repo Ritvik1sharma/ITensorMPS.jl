@@ -572,6 +572,7 @@ Steps:
 function stable_factorize(
     phi::ITensor,
     indsMb;           # already sorted by canonicalize_phi_inds
+    level               = 1,
     ortho               = "left",
     mindim              = nothing,
     maxdim              = nothing,
@@ -589,10 +590,57 @@ function stable_factorize(
 )
     # ── 0. Sparse-psi fast path ────────────────────────────────────────────────
     if ITensors.has_external_storage(phi)
+
         return SparseBackends.itensor_blocksparse_svd(phi, indsMb;
-                   ortho, maxdim=something(maxdim, typemax(Int)),
-                   mindim=something(mindim, 1),
-                   cutoff=Float64(something(cutoff, 0.0)), tags)
+            ortho, maxdim, mindim, cutoff,
+            tags = ITensors.TagSet("Link,l=$level"))
+
+        # return SparseBackends.itensor_blocksparse_svd(phi, indsMb;
+        #     ortho,
+        #     maxdim = something(maxdim, typemax(Int)),
+        #     mindim = something(mindim, 1),
+        #     cutoff = Float64(something(cutoff, 0.0)),
+        #     tags)
+
+
+        # wrapped = ITensors.get_external_storage(phi)              # WrappedBlockSparse{T,N,N2,P}
+        # bs      = wrapped.blocksparse                # NewBlockSparseSorted
+        # P       = SparseBackends._P(bs)   # or pull P from the type — see below
+        # sparse_inds = wrapped.inds[1:P]              # the sparse half of phi's legs
+        # phi_inds    = wrapped.inds                     # all legs of phi
+        # dense_inds  = wrapped.inds[P+1:end]
+        # # nls = count(i -> i ∈ sparse_inds, indsMb)
+        # # nld = length(indsMb) - nls
+
+        # indsMb_in_phi = filter(i -> i ∈ phi_inds, indsMb)
+        # nls = count(i -> i ∈ sparse_inds, indsMb_in_phi)
+        # nld = count(i -> i ∈ dense_inds,  indsMb_in_phi)
+
+
+        # # wrapped = ITensors.get_external_storage(phi)        
+        # # P_phi   = _P(wrapped)
+        # # sparse_inds = wrapped.inds[1:P_phi]
+
+        # # @show wrapped.inds
+        # # @show sparse_inds
+        # # @show indsMb
+        # # @show [i ∈ sparse_inds for i in indsMb]
+        # # nls = count(i -> i ∈ sparse_inds, indsMb)
+        # # nld = length(indsMb) - nls
+        # # @show nls, nld
+
+        # return SparseBackends.blocksparse_svd(bs;
+        #     n_left_sparse = nls,
+        #     n_left_dense  = nld,
+        #     ortho,
+        #     maxdim = something(maxdim, typemax(Int)),
+        #     mindim = something(mindim, 1),
+        #     cutoff = Float64(something(cutoff, 0.0)))
+
+        # # return SparseBackends.itensor_blocksparse_svd(phi, indsMb;
+        # #            ortho, maxdim=something(maxdim, typemax(Int)),
+        # #            mindim=something(mindim, 1),
+        # #            cutoff=Float64(something(cutoff, 0.0)), tags)
     end
     # ── 1. Direct SVD ─────────────────────────────────────────────────────────
     result = ITensors.svd(
@@ -1129,6 +1177,7 @@ function replacebond!(
         L, R, spec = stable_factorize(
             phi,
             indsMb;
+            level = b,
             ortho,
             mindim,
             maxdim,
