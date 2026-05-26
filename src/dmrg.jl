@@ -1,9 +1,15 @@
 using Adapt: adapt
-using KrylovKit: eigsolve
+using KrylovKit: eigsolve, InnerProductVec
+import VectorInterface
 using NDTensors: scalartype, timer
 using Printf: @printf
 using TupleTools: TupleTools
 import SparseBackends
+
+# Tell KrylovKit/VectorInterface what scalar type an ITensor uses when it's
+# wrapped in InnerProductVec for the M-inner-product Lanczos path. Defined at
+# module scope so it's resolved once, not in the inner dmrg loop.
+VectorInterface.scalartype(::Type{ITensors.ITensor}) = ComplexF64
 
 function naive_overlap(psi1::MPS, psi2::MPS)
   psi1dag = dag(psi1)
@@ -518,17 +524,15 @@ function dmrg(
   psi = copy(psi0)
   N = length(psi)
 
-  if !ITensors.has_external_storage(psi[1])
-    if !isortho(psi) || orthocenter(psi) != 1
-      psi = orthogonalize!(PH, psi, 1)
-    end
-    @assert isortho(psi) && orthocenter(psi) == 1
+  if !isortho(psi) || orthocenter(psi) != 1
+    psi = orthogonalize!(PH, psi, 1)
+  end
+  @assert isortho(psi) && orthocenter(psi) == 1
 
-    if !isnothing(write_when_maxdim_exceeds)
-      if (maxlinkdim(psi) > write_when_maxdim_exceeds) ||
-        (maxdim(sweeps, 1) > write_when_maxdim_exceeds)
-        PH = disk(PH; path=write_path)
-      end
+  if !isnothing(write_when_maxdim_exceeds)
+    if (maxlinkdim(psi) > write_when_maxdim_exceeds) ||
+      (maxdim(sweeps, 1) > write_when_maxdim_exceeds)
+      PH = disk(PH; path=write_path)
     end
   end
 
@@ -559,6 +563,14 @@ function dmrg(
     check_equality!(tensor_tracker, PH, psi; only_store=only_store, only_idx=only_idx)
   end
 
+  # Path-B gram-env cache: incremental L[i], R[i] for sparse psi.
+  # Built once here, then updated per replacebond! step (one contraction
+  # instead of O(N) rebuild). When psi is dense, gram_cache stays `nothing`
+  # and the dense path is unaffected.
+  gram_cache = SparseBackends.is_sparse_mps(psi) ?
+               SparseBackends.init_gram_cache(psi) :
+               nothing
+
   for sw in 1:nsweep(sweeps)
     sw_time = @elapsed begin
       maxtruncerr = 0.0
@@ -581,7 +593,20 @@ function dmrg(
           end
 
           timer = @elapsed begin
-            PH = position!(PH, psi, b)
+            # Per-matvec bond-position context for permute-profile probes.
+            ITensorMPS._BOND_POSITION[] = b
+            ITensorMPS._SWEEP_NUM[] = sw
+            ENV["SB_BOND"] = string(b)
+            @timeit PROJMPO_TIMER "dmrg.position!" begin
+              ITensorMPS._IN_POSITION[] = true
+              ENV["SB_IN_POSITION"] = "1"
+              try
+                PH = position!(PH, psi, b)
+              finally
+                ITensorMPS._IN_POSITION[] = false
+                ENV["SB_IN_POSITION"] = "0"
+              end
+            end
           end
           pos_time += timer
 
@@ -641,23 +666,127 @@ function dmrg(
 
           # println("eigsolve at sweep $sw, half $ha, bond ($b, $(b+1))")
           time = @elapsed begin
-            @timeit_debug timer "dmrg: eigsolve" begin
-              vals, vecs = eigsolve(
-                PH,
-                phi,
-                1,
-                eigsolve_which_eigenvalue;
-                ishermitian,
-                tol=eigsolve_tol,
-                krylovdim=eigsolve_krylovdim,
-                maxiter=eigsolve_maxiter,
-                verbosity=eigsolve_verbosity,
-              )
+            @timeit PROJMPO_TIMER "dmrg.eigsolve" begin
+              # BMF_ISO_PATH=1: psi is sparse AND we enforce strict iso SVD in
+              # stable_factorize → L^T L = I → no M correction needed → just
+              # use standard Lanczos. Trades nothing if iso_cap doesn't bind.
+              if SparseBackends.is_sparse_mps(psi) && get(ENV, "BMF_ISO_PATH", "0") != "1"
+                # Path B (Lanczos / symmetric whitening): B y = E y where
+                # B = M^(-1/2) · H · M^(-1/2), y = M^(1/2) phi.
+                # B is Hermitian AND restricted to image(M) (Linv kills null
+                # space), so :SR robustly returns the true ground state
+                # without spurious zero eigenvalues.
+                @timeit PROJMPO_TIMER "dmrg.gram_envs" begin
+                  # Incremental cache: O(1) lookup for Lgram, Rgram.
+                  Lgram = SparseBackends.get_left_gram(gram_cache, b)
+                  Rgram = SparseBackends.get_right_gram(gram_cache, b)
+                  # Factored: M = Lgram ⊗ Rgram (no shared inds), so
+                  # M^(±1/2) factorizes too. Per-side eigen on small
+                  # (bond_dim_total)² matrices instead of combined
+                  # (bond_dim²)² matrix → orders of magnitude less eigen
+                  # work AND no full M densification.
+                  Mhalf_L, Linv_L, Mhalf_R, Linv_R =
+                    SparseBackends.build_minv_half_pair_factored(Lgram, Rgram; phi_template=phi)
+                end
+
+                M_dot = (x, y) -> begin
+                    # M_L · y = Mhalf_L · (Mhalf_L · y)
+                    My = SparseBackends.apply_minv_preserve_bs(Mhalf_L, y,  y)   # M_L^{1/2} · y
+                    My = SparseBackends.apply_minv_preserve_bs(Mhalf_L, My, y)   # M_L^{1/2} · above = M_L · y
+                    # M_R · result = Mhalf_R · (Mhalf_R · result)
+                    My = SparseBackends.apply_minv_preserve_bs(Mhalf_R, My, y)   # M_R^{1/2} · 
+                    My = SparseBackends.apply_minv_preserve_bs(Mhalf_R, My, y)   # M_R^{1/2} · above = M_R ·
+                    return inner(x, My)
+                end
+                phi_wrapped = InnerProductVec(phi, M_dot)
+                # H_op must return a tensor type-identical to phi (same BS
+                # axis order + dims) so KrylovKit's add!! between Krylov basis
+                # vectors works. product(PH, v) goes through contract_preserve_bs
+                # with template=nothing — its BS structure can drift from phi.
+                # Recast Hv back into phi's structure here.
+                H_op = function(v)
+                  Hv = product(PH, v[])
+                  if ITensors.has_external_storage(Hv) && ITensors.has_external_storage(phi)
+                    Tw = ITensors.get_external_storage(phi)
+                    Cw = ITensors.get_external_storage(Hv)
+                    if Cw isa SparseBackends.WrappedBlockSparse && Tw isa SparseBackends.WrappedBlockSparse
+                      Hv = ITensors._itensor_from_external_storage(
+                          SparseBackends.recast_bs_to_template(Cw, Tw))
+                    end
+                  end
+                  return InnerProductVec(Hv, M_dot)
+                end
+                # M-inner-product Lanczos needs MORE Krylov vectors than the
+                # symmetric-whitening B-op variant for the same convergence —
+                # the M-inner-product frame is harder spectrally (M may be
+                # near-singular on the null space of P, no implicit filter).
+                # Match the old B_op floors (krylovdim≥30, maxiter≥10).
+                vals, vecs = eigsolve(
+                    H_op,
+                    phi_wrapped,
+                    1,
+                    eigsolve_which_eigenvalue;
+                    ishermitian = true,
+                    tol          = eigsolve_tol,
+                    krylovdim    = max(eigsolve_krylovdim, 30),
+                    maxiter      = max(eigsolve_maxiter, 10),
+                    verbosity    = eigsolve_verbosity,
+                )
+
+                # unwrap eigenvectors — no back-transform needed
+                vecs = [v[] for v in vecs]
+
+
+                # # y = M^(1/2) phi = Mhalf_L · Mhalf_R · phi (applied per-side).
+                # phi_y = SparseBackends.apply_minv_preserve_bs(Mhalf_L, phi, phi)
+                # phi_y = SparseBackends.apply_minv_preserve_bs(Mhalf_R, phi_y, phi)
+                # B_op = function (y)
+                #   phi_x = SparseBackends.apply_minv_preserve_bs(Linv_L, y, y)
+                #   phi_x = SparseBackends.apply_minv_preserve_bs(Linv_R, phi_x, y)
+                #   Hphi  = product(PH, phi_x)
+                #   z = SparseBackends.apply_minv_preserve_bs(Linv_L, Hphi, y)
+                #   z = SparseBackends.apply_minv_preserve_bs(Linv_R, z, y)
+                #   return z
+                # end
+                # vals, vecs = eigsolve(
+                #   B_op,
+                #   phi_y,
+                #   1,
+                #   eigsolve_which_eigenvalue;
+                #   ishermitian=false,
+                #   tol=eigsolve_tol,
+                #   krylovdim=max(eigsolve_krylovdim, 30),
+                #   maxiter=max(eigsolve_maxiter, 10),
+                #   verbosity=eigsolve_verbosity,
+                # )
+                # vecs = [
+                #   let
+                #     x1 = SparseBackends.apply_minv_preserve_bs(Linv_L, y, y)
+                #     SparseBackends.apply_minv_preserve_bs(Linv_R, x1, y)
+                #   end
+                #   for y in vecs
+                # ]
+              else
+                vals, vecs = eigsolve(
+                  PH,
+                  phi,
+                  1,
+                  eigsolve_which_eigenvalue;
+                  ishermitian,
+                  tol=eigsolve_tol,
+                  krylovdim=eigsolve_krylovdim,
+                  maxiter=eigsolve_maxiter,
+                  verbosity=eigsolve_verbosity,
+                )
+              end
             end
           end
           opt_time += time
 
-          energy = vals[1]
+          # Path-B uses the symmetric Cholesky/whitening transform so the
+          # eigsolve runs with ishermitian=true (Lanczos). vals[1] is real
+          # already in that case; the explicit `real()` is just defensive.
+          energy = SparseBackends.is_sparse_mps(psi) ? real(vals[1]) : vals[1]
           ## Right now there is a conversion problem in CUDA.jl where `UnifiedMemory` Arrays are being converted
           ## into `DeviceMemory`. This conversion line is here temporarily to fix that problem when it arises
           ## Adapt is only called when using CUDA backend. CPU will work as implemented previously.
@@ -702,7 +831,7 @@ function dmrg(
           end
 
           t = @elapsed begin
-            @timeit_debug timer "dmrg: replacebond!" begin
+            @timeit PROJMPO_TIMER "dmrg.replacebond!" begin
               spec = replacebond!(
                 PH,
                 psi,
@@ -723,6 +852,19 @@ function dmrg(
           # println("================ print here ================ ", ITensors.has_external_storage(phi))
 
           maxtruncerr = max(maxtruncerr, spec.truncerr)
+
+          # Path-B: update incremental gram-env cache after replacebond!.
+          # Forward sweep (ha=1, ortho="left"): psi[b] is now the new left-
+          # ortho tensor → L[b+1] must be refreshed.
+          # Backward sweep (ha=2, ortho="right"): psi[b+1] is the new right-
+          # ortho tensor → R[b+1] must be refreshed.
+          if gram_cache !== nothing
+            if ha == 1
+              SparseBackends.update_left!(gram_cache, psi, b)
+            else
+              SparseBackends.update_right!(gram_cache, psi, b + 1)
+            end
+          end
 
           @debug_check begin
             checkflux(psi)

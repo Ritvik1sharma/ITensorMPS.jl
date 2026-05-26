@@ -533,8 +533,14 @@ replace_siteinds(M::MPS, sites) = replace_siteinds!(copy(M), sites)
 canonical_ind_key(i) = (string(tags(i)), plev(i), dim(i), Int(dir(i)))
 
 function canonicalize_phi_inds(phi::ITensor, indsMb)
+    # println("Canonicalizing phi indices ---- ", indsMb)
     ord = sort(collect(inds(phi)); by = canonical_ind_key)
-    phi_c = permute(phi, ord...)
+    # println("Canonical order: ", ord)
+    if ITensors.has_external_storage(phi)
+        phi_c = SparseBackends.permute(phi, ord...)
+    else
+        phi_c = permute(phi, ord...)
+    end
     indsMb_c = [i for i in ord if i in indsMb]
     return phi_c, indsMb_c
 end
@@ -586,14 +592,45 @@ function stable_factorize(
     rtol                = 1e-10,
     null_atol           = 1e-10,
     null_rtol           = 1e-6,
+    target_link_sparse_dim::Int = -1,    # pass through to the BlockSparse SVD
+                                          # so boundary bonds keep their original
+                                          # sparse dim (replacebond! computes it
+                                          # from M[b]/M[b+1] before contracting phi).
+    M_b                 = nothing,        # OLD M[b], M[b+1] tensors. When both
+    M_b1                = nothing,        # are sparse and provided, the sparse
+                                           # SVD routes through the channel-aware
+                                           # kernel so the new L, R preserve
+                                           # image(P) globally (not just per-bond
+                                           # block-key sets).
     debug               = false,
 )
-    # ── 0. Sparse-psi fast path ────────────────────────────────────────────────
+    # ── 0. Sparse-psi path ────────────────────────────────────────────────────
+    # When M_b and M_b1 are both sparse, use the channel-aware SVD: templates
+    # from M_b, M_b1 enforce that the new L, R block-key sets are subsets of
+    # the OLD ones, which is needed to keep ψ in image(P) across multi-factor
+    # bonds. relax_iso_cap=true: lets mult grow past the cross-channel iso cap
+    # in bulk bonds — Path B's M^{-1/2} correction absorbs the non-iso slack
+    # via the gram matrix during eigsolve. The iso cap is only geometrically
+    # required when all channels share L-rows (the cap formula is conservative
+    # otherwise), and DMRG sweeps don't need strict canonicality.
     if ITensors.has_external_storage(phi)
-
+        if M_b !== nothing && M_b1 !== nothing &&
+           ITensors.has_external_storage(M_b) && ITensors.has_external_storage(M_b1)
+            # BMF_ISO_PATH=1: enforce strict iso → L^T L = I → no M correction
+            # needed → DMRG runs standard Lanczos. Empirically (probe) cap_fired
+            # is false for this projector at the operating Schmidt rank.
+            iso_strict = get(ENV, "BMF_ISO_PATH", "0") == "1"
+            return SparseBackends.itensor_blocksparse_svd_channel_aware(
+                phi, M_b, M_b1;
+                ortho, maxdim, mindim, cutoff,
+                relax_iso_cap = !iso_strict)
+        end
+        # Fallback (no templates available — e.g. user-direct call): old path.
         return SparseBackends.itensor_blocksparse_svd(phi, indsMb;
             ortho, maxdim, mindim, cutoff,
-            tags = ITensors.TagSet("Link,l=$level"))
+            tags = ITensors.TagSet("Link,l=$level"),
+            bin_by_right = true,
+            target_n_new_sp = target_link_sparse_dim)
 
         # return SparseBackends.itensor_blocksparse_svd(phi, indsMb;
         #     ortho,
@@ -1158,9 +1195,11 @@ function replacebond!(
         indsMb = replaceind(indsMb, sb, sbp1)
     end
 
-    # 1) Canonicalize phi before factorization so equivalent tensors
-    # are matricized the same way.
-    # Skip for external storage (BlockSparse) phi: index order is part of the storage layout.
+    # 1) Canonicalize phi before factorization. Skip for sparse phi:
+    # canonicalize_phi_inds calls permute() which requires staying within
+    # the sparse-prefix / dense-suffix split — but the canonical leg ordering
+    # generally crosses that boundary. Sparse phi gets its own canonical
+    # ordering inside itensor_blocksparse_svd via reorder_invariant.
     if !ITensors.has_external_storage(phi)
         phi, indsMb = canonicalize_phi_inds(phi, indsMb)
     end
@@ -1173,6 +1212,11 @@ function replacebond!(
     # single-pass canonical phase/ordering).  Fall back to the old factorize path
     # for QR or eigen decompositions that don't produce singular values.
     use_stable = isnothing(which_decomp) || which_decomp == "svd"
+    # Capture the original M[b]↔M[b+1] sparse-link dim BEFORE the factorization
+    # rewrites those tensors. At a boundary the SVD's natural binning would
+    # collapse the new bond's sparse dim to 1; passing this hint forces the
+    # new bond to keep the same sparse dim as the old one (extra slots empty).
+    target_link_sparse_dim = SparseBackends.shared_bond_sparse_dim(M[b], M[b + 1])
     if use_stable
         L, R, spec = stable_factorize(
             phi,
@@ -1186,6 +1230,9 @@ function replacebond!(
             use_absolute_cutoff,
             use_relative_cutoff,
             min_blockdim,
+            target_link_sparse_dim,
+            M_b  = M[b],
+            M_b1 = M[b + 1],
             tags      = tags(linkind(M, b)),
             atol      = canonical_atol,
             rtol      = canonical_rtol,
@@ -1205,6 +1252,9 @@ function replacebond!(
         L, R = reorder_split_tensors(L, R)
     end
 
+    # println(ITensors.has_external_storage(L) ? "L has external storage." : "L is dense.")
+    # println(ITensors.has_external_storage(R) ? "R has external storage." : "R is dense.")
+
     if debug
         println("L, R inds are $(inds(L)), $(inds(R)), $spec")
     end
@@ -1214,6 +1264,11 @@ function replacebond!(
     if !ITensors.has_external_storage(L) && !ITensors.has_external_storage(R)
         L, R = reorder_split_tensors(L, R)
     end
+
+
+    # println(ITensors.has_external_storage(L) ? "After reorder, L has external storage." : "After reorder, L is dense.")
+    # println(ITensors.has_external_storage(R) ? "After reorder, R has external storage." : "After reorder, R is dense.")
+
     if debug
         println("L tensor ", L)
         println("R tensor ", R)
@@ -1232,6 +1287,8 @@ function replacebond!(
     else
         error("In replacebond!, got ortho = $ortho, only supports `left` and `right`.")
     end
+    # println(ITensors.has_external_storage(M[b]) ? "After replacebond!, M[$b] has external storage." : "After replacebond!, M[$b] is dense.")
+    # println(ITensors.has_external_storage(M[b+1]) ? "After replacebond!, M[$b+1] has external storage." : "After replacebond!, M[$(b+1)] is dense.")
     return spec
 end
 
@@ -1461,9 +1518,75 @@ function replacebond(M0::MPS, b::Int, phi::ITensor; kwargs...)
     return M
 end
 
-# Allows overloading `replacebond!` based on the projected
-# MPO type. By default just calls `replacebond!` on the MPS.
+"""
+    replacebond_sparse!(M, b, phi; ortho, maxdim, mindim, cutoff, normalize)
+
+Alternative `replacebond!` for an MPS whose tensors carry BlockSparse external
+storage. Uses `itensor_blocksparse_svd_channel_aware` which factorizes phi back
+into L, R that EXACTLY inherit M[b]'s and M[b+1]'s block-key sets — i.e. the
+factorization "lives in" the same restricted block subspace defined by the
+P_sparse channel structure. Cross-channel orthogonality follows from disjoint
+lk-sets per channel, so the isometric factor is globally isometric.
+"""
+function replacebond_sparse!(
+    M::MPS,
+    b::Int,
+    phi::ITensor;
+    normalize  = false,
+    ortho      = "left",
+    maxdim     = nothing,
+    mindim     = nothing,
+    cutoff     = nothing,
+    kwargs...
+)
+    @assert ITensors.has_external_storage(M[b])
+    @assert ITensors.has_external_storage(M[b + 1])
+    @assert ITensors.has_external_storage(phi) "phi must be block-sparse for replacebond_sparse!"
+
+    # Unified SVD: route through `itensor_blocksparse_svd_channel_aware` (same
+    # kernel that orthogonalize! and 3-arg replacebond!/stable_factorize use).
+    # Passing M[b], M[b+1] as templates lets the channel-aware path inherit
+    # their block-key sets and apply the per-channel mult cap (mult_cap =
+    # fld(maxdim, n_active_chan)) so total effective bond ≤ maxdim. Strict iso
+    # enforced when BMF_ISO_PATH=1 (default in tests).
+    iso_strict = get(ENV, "BMF_ISO_PATH", "0") == "1"
+    factor_fn = (get(ENV, "SB_USE_QR", "0") == "1") ?
+        SparseBackends.itensor_blocksparse_qr_channel_aware :
+        SparseBackends.itensor_blocksparse_svd_channel_aware
+    L, R, spec = factor_fn(
+        phi, M[b], M[b + 1];
+        ortho  = ortho,
+        maxdim = something(maxdim, typemax(Int)),
+        mindim = something(mindim, 1),
+        cutoff = Float64(something(cutoff, 0.0)),
+        relax_iso_cap = !iso_strict,
+    )
+
+    M[b]     = L
+    M[b + 1] = R
+
+    if ortho == "left"
+        leftlim(M)  == b - 1 && setleftlim!(M,  leftlim(M) + 1)
+        rightlim(M) == b + 1 && setrightlim!(M, rightlim(M) + 1)
+        normalize && (M[b + 1] ./= norm(M[b + 1]))
+    elseif ortho == "right"
+        leftlim(M)  == b     && setleftlim!(M,  leftlim(M) - 1)
+        rightlim(M) == b + 2 && setrightlim!(M, rightlim(M) - 1)
+        normalize && (M[b] ./= norm(M[b]))
+    else
+        error("replacebond_sparse!: unknown ortho=$ortho")
+    end
+
+    return spec
+end
+
+# Allows overloading `replacebond!` based on the projected MPO type.
+# Routes sparse psi through the channel-aware factorization.
 function replacebond!(PH, M::MPS, b::Int, phi::ITensor; kwargs...)
+    if ITensors.has_external_storage(M[b]) && ITensors.has_external_storage(M[b + 1]) &&
+       ITensors.has_external_storage(phi)
+        return replacebond_sparse!(M, b, phi; kwargs...)
+    end
     return replacebond!(M, b, phi; kwargs...)
 end
 

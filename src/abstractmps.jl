@@ -1621,15 +1621,24 @@ function orthogonalize!(M::AbstractMPS, j::Int; maxdim = nothing, normalize = no
         b = leftlim(M) + 1
         lb = linkind(M, b)
         ltags = !isnothing(lb) ? tags(lb) : TagSet("Link,l=$b")
-        if ITensors.has_external_storage(M[b])
-            # Sparse site: densify for factorize, then absorb R into the next sparse site.
-            # L (small isometry) is kept dense; R * M[b+1] stays WrappedBlockSparse
-            # via the existing sparse×dense contract dispatch.
-            A = SparseBackends.to_dense_itensors(M[b])
-            linds = uniqueinds(A, M[b + 1])
-            L, R = factorize(A, linds; tags = ltags, maxdim)
+        if ITensors.has_external_storage(M[b]) && ITensors.has_external_storage(M[b + 1])
+            # Channel-aware path: factorize phi = M[b]*M[b+1] so the new L, R
+            # inherit M[b]'s and M[b+1]'s block-key sets exactly AND L is
+            # globally isometric (cross-channel rows disjoint by construction).
+            # This gives a properly canonical right-orth state without leaking
+            # structure or breaking <phi|phi> = <psi|psi>.
+            phi = M[b] * M[b + 1]
+            factor_fn = (get(ENV, "SB_USE_QR", "0") == "1") ?
+                SparseBackends.itensor_blocksparse_qr_channel_aware :
+                SparseBackends.itensor_blocksparse_svd_channel_aware
+            L, R, _ = factor_fn(
+                phi, M[b], M[b + 1];
+                ortho  = "left",
+                maxdim = something(maxdim, typemax(Int)),
+                mindim = 1, cutoff = 0.0,
+            )
             M[b]     = L
-            M[b + 1] = R * M[b + 1]
+            M[b + 1] = R
         else
             linds = uniqueinds(M[b], M[b + 1])
             L, R = factorize(M[b], linds; tags = ltags, maxdim)
@@ -1649,15 +1658,22 @@ function orthogonalize!(M::AbstractMPS, j::Int; maxdim = nothing, normalize = no
         b = rightlim(M) - 2
         lb = linkind(M, b)
         ltags = !isnothing(lb) ? tags(lb) : TagSet("Link,l=$b")
-        if ITensors.has_external_storage(M[b + 1])
-            # Sparse site: densify for factorize, then absorb R into the previous sparse site.
-            # L (small isometry) is kept dense; M[b] * R stays WrappedBlockSparse
-            # via the existing sparse×dense contract dispatch.
-            A = SparseBackends.to_dense_itensors(M[b + 1])
-            rinds = uniqueinds(A, M[b])
-            L, R = factorize(A, rinds; tags = ltags, maxdim)
-            M[b + 1] = L
-            M[b]    *= R
+        if ITensors.has_external_storage(M[b + 1]) && ITensors.has_external_storage(M[b])
+            # Channel-aware path (mirror of forward sweep): factorize
+            # phi = M[b]*M[b+1] so L = new M[b] (carries SVs) and R = new M[b+1]
+            # is globally right-isometric, preserving block-key structure.
+            phi = M[b] * M[b + 1]
+            factor_fn = (get(ENV, "SB_USE_QR", "0") == "1") ?
+                SparseBackends.itensor_blocksparse_qr_channel_aware :
+                SparseBackends.itensor_blocksparse_svd_channel_aware
+            L, R, _ = factor_fn(
+                phi, M[b], M[b + 1];
+                ortho  = "right",
+                maxdim = something(maxdim, typemax(Int)),
+                mindim = 1, cutoff = 0.0,
+            )
+            M[b]     = L
+            M[b + 1] = R
         else
             rinds = uniqueinds(M[b + 1], M[b])
             L, R = factorize(M[b + 1], rinds; tags = ltags, maxdim)
