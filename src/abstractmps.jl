@@ -1627,16 +1627,50 @@ function orthogonalize!(M::AbstractMPS, j::Int; maxdim = nothing, normalize = no
             # globally isometric (cross-channel rows disjoint by construction).
             # This gives a properly canonical right-orth state without leaking
             # structure or breaking <phi|phi> = <psi|psi>.
-            phi = M[b] * M[b + 1]
-            factor_fn = (get(ENV, "SB_USE_QR", "0") == "1") ?
-                SparseBackends.itensor_blocksparse_qr_channel_aware :
-                SparseBackends.itensor_blocksparse_svd_channel_aware
-            L, R, _ = factor_fn(
-                phi, M[b], M[b + 1];
-                ortho  = "left",
-                maxdim = something(maxdim, typemax(Int)),
-                mindim = 1, cutoff = 0.0,
-            )
+            # For aliased-stored psi the default `*` would densify the result;
+            # route through preserve_bs_output=true so phi stays aliased.
+            is_aliased_pair =
+                M[b].tensor.data isa SparseBackends.WrappedAliasedBlockSparse &&
+                M[b + 1].tensor.data isa SparseBackends.WrappedAliasedBlockSparse
+            phi = if is_aliased_pair
+                Aw = ITensors.get_external_storage(M[b])
+                Bw = ITensors.get_external_storage(M[b + 1])
+                Cw = SparseBackends.wrapped_contract_aliased(Aw, Bw; preserve_bs_output=true)
+                _phi = Cw isa ITensors.ITensor ? Cw : ITensors._itensor_from_external_storage(Cw)
+                SparseBackends.schema_dbg("orthoL b=$b: M[b]", M[b])
+                SparseBackends.schema_dbg("orthoL b=$b: M[b+1]", M[b+1])
+                SparseBackends.schema_dbg("orthoL b=$b: phi=combine(M[b],M[b+1])", _phi)
+                _phi
+            else
+                M[b] * M[b + 1]
+            end
+            if is_aliased_pair
+                get(ENV, "SB_ALIASED_TRACE", "0") == "1" &&
+                    println("[SB_ALIASED_TRACE orthogonalize! LEFT b=$b] aliased branch FIRES")
+                # Aliased-aware decomposition: dense SVD + re-aliasify (Tier 1).
+                # Does NOT call the BS QR/SVD channel-aware kernel.
+                L, R, _ = SparseBackends.itensor_aliased_factorize(
+                    phi, M[b], M[b + 1];
+                    ortho  = "left",
+                    maxdim = something(maxdim, typemax(Int)),
+                    mindim = 1, cutoff = 0.0,
+                )
+                SparseBackends.schema_dbg("orthoL b=$b: L (factorized)", L)
+                SparseBackends.schema_dbg("orthoL b=$b: R (factorized)", R)
+                if get(ENV, "SB_ALIASED_TRACE", "0") == "1"
+                    println("  L=", typeof(L.tensor.data), "  R=", typeof(R.tensor.data))
+                end
+            else
+                factor_fn = (get(ENV, "SB_USE_QR", "0") == "1") ?
+                    SparseBackends.itensor_blocksparse_qr_channel_aware :
+                    SparseBackends.itensor_blocksparse_svd_channel_aware
+                L, R, _ = factor_fn(
+                    phi, M[b], M[b + 1];
+                    ortho  = "left",
+                    maxdim = something(maxdim, typemax(Int)),
+                    mindim = 1, cutoff = 0.0,
+                )
+            end
             M[b]     = L
             M[b + 1] = R
         else
@@ -1662,18 +1696,47 @@ function orthogonalize!(M::AbstractMPS, j::Int; maxdim = nothing, normalize = no
             # Channel-aware path (mirror of forward sweep): factorize
             # phi = M[b]*M[b+1] so L = new M[b] (carries SVs) and R = new M[b+1]
             # is globally right-isometric, preserving block-key structure.
-            phi = M[b] * M[b + 1]
-            factor_fn = (get(ENV, "SB_USE_QR", "0") == "1") ?
-                SparseBackends.itensor_blocksparse_qr_channel_aware :
-                SparseBackends.itensor_blocksparse_svd_channel_aware
-            L, R, _ = factor_fn(
-                phi, M[b], M[b + 1];
-                ortho  = "right",
-                maxdim = something(maxdim, typemax(Int)),
-                mindim = 1, cutoff = 0.0,
-            )
+            # Aliased-aware preserve path mirrors the forward sweep above.
+            is_aliased_pair =
+                M[b].tensor.data isa SparseBackends.WrappedAliasedBlockSparse &&
+                M[b + 1].tensor.data isa SparseBackends.WrappedAliasedBlockSparse
+            phi = if is_aliased_pair
+                Aw = ITensors.get_external_storage(M[b])
+                Bw = ITensors.get_external_storage(M[b + 1])
+                Cw = SparseBackends.wrapped_contract_aliased(Aw, Bw; preserve_bs_output=true)
+                Cw isa ITensors.ITensor ? Cw : ITensors._itensor_from_external_storage(Cw)
+            else
+                M[b] * M[b + 1]
+            end
+            if is_aliased_pair
+                get(ENV, "SB_ALIASED_TRACE", "0") == "1" &&
+                    println("[SB_ALIASED_TRACE orthogonalize! RIGHT b=$b] aliased branch FIRES  phi storage=", ITensors.has_external_storage(phi) ? typeof(phi.tensor.data) : "dense")
+                L, R, _ = SparseBackends.itensor_aliased_factorize(
+                    phi, M[b], M[b + 1];
+                    ortho  = "right",
+                    maxdim = something(maxdim, typemax(Int)),
+                    mindim = 1, cutoff = 0.0,
+                )
+                if get(ENV, "SB_ALIASED_TRACE", "0") == "1"
+                    println("  RIGHT L=", typeof(L.tensor.data), "  R=", typeof(R.tensor.data))
+                end
+            else
+                factor_fn = (get(ENV, "SB_USE_QR", "0") == "1") ?
+                    SparseBackends.itensor_blocksparse_qr_channel_aware :
+                    SparseBackends.itensor_blocksparse_svd_channel_aware
+                L, R, _ = factor_fn(
+                    phi, M[b], M[b + 1];
+                    ortho  = "right",
+                    maxdim = something(maxdim, typemax(Int)),
+                    mindim = 1, cutoff = 0.0,
+                )
+            end
             M[b]     = L
             M[b + 1] = R
+            if get(ENV, "SB_ALIASED_TRACE", "0") == "1"
+                println("  RIGHT post-assign  M[b]=", typeof(M[b].tensor.data),
+                        "  M[b+1]=", typeof(M[b+1].tensor.data))
+            end
         else
             rinds = uniqueinds(M[b + 1], M[b])
             L, R = factorize(M[b + 1], rinds; tags = ltags, maxdim)

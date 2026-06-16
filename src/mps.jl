@@ -607,23 +607,16 @@ function stable_factorize(
     # ── 0. Sparse-psi path ────────────────────────────────────────────────────
     # When M_b and M_b1 are both sparse, use the channel-aware SVD: templates
     # from M_b, M_b1 enforce that the new L, R block-key sets are subsets of
-    # the OLD ones, which is needed to keep ψ in image(P) across multi-factor
-    # bonds. relax_iso_cap=true: lets mult grow past the cross-channel iso cap
-    # in bulk bonds — Path B's M^{-1/2} correction absorbs the non-iso slack
-    # via the gram matrix during eigsolve. The iso cap is only geometrically
-    # required when all channels share L-rows (the cap formula is conservative
-    # otherwise), and DMRG sweeps don't need strict canonicality.
+    # the OLD ones, needed to keep ψ in image(P) across multi-factor bonds.
+    # The per-cM cap (chi_cap = min(chi_rank, per_cM_cap)) inside the factorization
+    # is always applied — it's required for uniform-multiplicity storage to stay
+    # within maxdim.
     if ITensors.has_external_storage(phi)
         if M_b !== nothing && M_b1 !== nothing &&
            ITensors.has_external_storage(M_b) && ITensors.has_external_storage(M_b1)
-            # BMF_ISO_PATH=1: enforce strict iso → L^T L = I → no M correction
-            # needed → DMRG runs standard Lanczos. Empirically (probe) cap_fired
-            # is false for this projector at the operating Schmidt rank.
-            iso_strict = get(ENV, "BMF_ISO_PATH", "0") == "1"
             return SparseBackends.itensor_blocksparse_svd_channel_aware(
                 phi, M_b, M_b1;
-                ortho, maxdim, mindim, cutoff,
-                relax_iso_cap = !iso_strict)
+                ortho, maxdim, mindim, cutoff)
         end
         # Fallback (no templates available — e.g. user-direct call): old path.
         return SparseBackends.itensor_blocksparse_svd(phi, indsMb;
@@ -1546,33 +1539,76 @@ function replacebond_sparse!(
     # Unified SVD: route through `itensor_blocksparse_svd_channel_aware` (same
     # kernel that orthogonalize! and 3-arg replacebond!/stable_factorize use).
     # Passing M[b], M[b+1] as templates lets the channel-aware path inherit
-    # their block-key sets and apply the per-channel mult cap (mult_cap =
-    # fld(maxdim, n_active_chan)) so total effective bond ≤ maxdim. Strict iso
-    # enforced when BMF_ISO_PATH=1 (default in tests).
-    iso_strict = get(ENV, "BMF_ISO_PATH", "0") == "1"
-    factor_fn = (get(ENV, "SB_USE_QR", "0") == "1") ?
-        SparseBackends.itensor_blocksparse_qr_channel_aware :
-        SparseBackends.itensor_blocksparse_svd_channel_aware
-    L, R, spec = factor_fn(
-        phi, M[b], M[b + 1];
-        ortho  = ortho,
-        maxdim = something(maxdim, typemax(Int)),
-        mindim = something(mindim, 1),
-        cutoff = Float64(something(cutoff, 0.0)),
-        relax_iso_cap = !iso_strict,
-    )
+    # their block-key sets. The per-cM cap (= floor(maxdim / n_channels)) is
+    # always applied inside the factorization to keep total bond ≤ maxdim
+    # under uniform-multiplicity storage. SB_USE_QR=1 selects the QR+GS
+    # variant (strict iso); SB_USE_OWNED_SVD=1 selects per-cM SVD with
+    # primary-ownership (non-iso, used by Path B's M-corrected eigsolve).
+    _tr_alias = get(ENV, "SB_ALIASED_TRACE", "0") == "1"
+    if _tr_alias
+        println("[SB_ALIASED_TRACE replacebond_sparse! ENTRY b=$b]  M[b] = ",
+            ITensors.has_external_storage(M[b]) ? typeof(M[b].tensor.data) : "dense",
+            "  M[b+1] = ",
+            ITensors.has_external_storage(M[b+1]) ? typeof(M[b+1].tensor.data) : "dense",
+            "  phi = ",
+            ITensors.has_external_storage(phi) ? typeof(phi.tensor.data) : "dense")
+    end
+    L, R, spec = if M[b].tensor.data isa SparseBackends.WrappedAliasedBlockSparse &&
+                    M[b + 1].tensor.data isa SparseBackends.WrappedAliasedBlockSparse
+        if _tr_alias
+            println("[SB_ALIASED_TRACE replacebond_sparse! b=$b]  phi storage = ",
+                ITensors.has_external_storage(phi) ? typeof(phi.tensor.data) : "dense")
+            println("  M[b] storage   = ", typeof(M[b].tensor.data),
+                    "  M[b+1] storage = ", typeof(M[b+1].tensor.data))
+        end
+        L, R, spec = SparseBackends.itensor_aliased_factorize(
+            phi, M[b], M[b + 1];
+            ortho  = ortho,
+            maxdim = something(maxdim, typemax(Int)),
+            mindim = something(mindim, 1),
+            cutoff = Float64(something(cutoff, 0.0)),
+        )
+        if _tr_alias
+            println("  factorize L storage = ", ITensors.has_external_storage(L) ? typeof(L.tensor.data) : "dense")
+            println("  factorize R storage = ", ITensors.has_external_storage(R) ? typeof(R.tensor.data) : "dense")
+        end
+        L, R, spec
+    else
+        factor_fn = if get(ENV, "SB_USE_OWNED_SVD", "0") == "1"
+            SparseBackends.itensor_blocksparse_svd_owned_channel_aware
+        elseif get(ENV, "SB_USE_QR", "0") == "1"
+            SparseBackends.itensor_blocksparse_qr_channel_aware
+        else
+            SparseBackends.itensor_blocksparse_svd_channel_aware
+        end
+        factor_fn(
+            phi, M[b], M[b + 1];
+            ortho  = ortho,
+            maxdim = something(maxdim, typemax(Int)),
+            mindim = something(mindim, 1),
+            cutoff = Float64(something(cutoff, 0.0)),
+        )
+    end
 
     M[b]     = L
     M[b + 1] = R
+    if _tr_alias
+        println("  after assign:  M[b]  = ", ITensors.has_external_storage(M[b])   ? typeof(M[b].tensor.data)   : "dense",
+                "  M[b+1] = ", ITensors.has_external_storage(M[b+1]) ? typeof(M[b+1].tensor.data) : "dense")
+    end
 
     if ortho == "left"
         leftlim(M)  == b - 1 && setleftlim!(M,  leftlim(M) + 1)
         rightlim(M) == b + 1 && setrightlim!(M, rightlim(M) + 1)
         normalize && (M[b + 1] ./= norm(M[b + 1]))
+        _tr_alias && normalize && println("  after normalize M[b+1] ./= norm: M[b+1] = ",
+            ITensors.has_external_storage(M[b+1]) ? typeof(M[b+1].tensor.data) : "dense")
     elseif ortho == "right"
         leftlim(M)  == b     && setleftlim!(M,  leftlim(M) - 1)
         rightlim(M) == b + 2 && setrightlim!(M, rightlim(M) - 1)
         normalize && (M[b] ./= norm(M[b]))
+        _tr_alias && normalize && println("  after normalize M[b] ./= norm: M[b] = ",
+            ITensors.has_external_storage(M[b]) ? typeof(M[b].tensor.data) : "dense")
     else
         error("replacebond_sparse!: unknown ortho=$ortho")
     end
@@ -1583,6 +1619,14 @@ end
 # Allows overloading `replacebond!` based on the projected MPO type.
 # Routes sparse psi through the channel-aware factorization.
 function replacebond!(PH, M::MPS, b::Int, phi::ITensor; kwargs...)
+    if get(ENV, "SB_ALIASED_TRACE", "0") == "1"
+        println("[SB_ALIASED_TRACE replacebond! ENTRY b=$b]  M[b]=",
+            ITensors.has_external_storage(M[b]) ? typeof(M[b].tensor.data) : "dense",
+            "  M[b+1]=",
+            ITensors.has_external_storage(M[b+1]) ? typeof(M[b+1].tensor.data) : "dense",
+            "  phi=",
+            ITensors.has_external_storage(phi) ? typeof(phi.tensor.data) : "dense")
+    end
     if ITensors.has_external_storage(M[b]) && ITensors.has_external_storage(M[b + 1]) &&
        ITensors.has_external_storage(phi)
         return replacebond_sparse!(M, b, phi; kwargs...)

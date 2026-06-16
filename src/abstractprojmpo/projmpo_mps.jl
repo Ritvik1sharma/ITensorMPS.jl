@@ -50,8 +50,8 @@ end
 
 Base.size(P::ProjMPO_MPS) = size(P.H)
 
-function position!(P::ProjMPO_MPS, psi::MPS, pos::Int)
-    position!(P.PH, psi, pos)
+function position!(P::ProjMPO_MPS, psi::MPS, pos::Int; debug::Bool=false)
+    position!(P.PH, psi, pos; debug=debug)
     for p in P.pm
         position!(p, psi, pos)
     end
