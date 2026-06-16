@@ -1,5 +1,6 @@
 using Adapt: adapt
 using KrylovKit: eigsolve, InnerProductVec
+const _EIGSOLVE_PHI_TRACE_COUNT = Ref(0)
 import VectorInterface
 using NDTensors: scalartype, timer
 using Printf: @printf
@@ -22,6 +23,15 @@ function permute(
 )::typeof(M)
   M̃ = typeof(M)(length(M))
   for n in 1:length(M)
+    if ITensors.has_external_storage(M[n])
+      lₙ₋₁ = n > 1 ? commonind(M[n], M[n-1]) : nothing
+      lₙ   = n < length(M) ? commonind(M[n], M[n+1]) : nothing
+      s⃗ₙ   = TupleTools.sort(Tuple(siteinds(M, n)); by=plev)
+      expected = filter(!isnothing, (lₙ₋₁, s⃗ₙ..., lₙ))
+      @assert all(i -> i ∈ inds(M[n]), expected) "Site $n missing expected MPS indices: $expected"
+      M̃[n] = M[n]
+      continue
+    end
     lₙ₋₁ = linkind(M, n - 1)
     lₙ = linkind(M, n)
     s⃗ₙ = TupleTools.sort(Tuple(siteinds(M, n)); by=plev)
@@ -621,7 +631,40 @@ function dmrg(
           end
 
           @timeit_debug timer "dmrg: psi[b]*psi[b+1]" begin
-            phi = psi[b] * psi[b + 1]
+            # Aliased psi: preserve aliased output so the factorize gets an
+            # aliased phi. Otherwise the default `*` falls into the
+            # Aliased×Aliased BS fallback and crashes.
+            phi = if ITensors.has_external_storage(psi[b]) &&
+                     ITensors.has_external_storage(psi[b + 1]) &&
+                     psi[b].tensor.data isa SparseBackends.WrappedAliasedBlockSparse &&
+                     psi[b + 1].tensor.data isa SparseBackends.WrappedAliasedBlockSparse
+              Aw = ITensors.get_external_storage(psi[b])
+              Bw = ITensors.get_external_storage(psi[b + 1])
+              Cw = SparseBackends.wrapped_contract_aliased(Aw, Bw; preserve_bs_output=true)
+              Cw isa ITensors.ITensor ? Cw : ITensors._itensor_from_external_storage(Cw)
+            else
+              psi[b] * psi[b + 1]
+            end
+          end
+          SparseBackends.schema_dbg("eigsolve-OPERAND phi b=$b", phi)
+
+          if get(ENV, "SB_FACT_DIAG", "0") == "1"
+            _clsdump(lbl, T) = begin
+              if ITensors.has_external_storage(T) && T.tensor.data isa SparseBackends.WrappedAliasedBlockSparse
+                w = T.tensor.data; P = SparseBackends._abs_head_len(w); N = ndims(w.aliased)
+                println("   [", lbl, "] P=$P  prefix=",
+                        [(ITensors.dim(w.inds[i]), string(ITensors.tags(w.inds[i])), ITensors.plev(w.inds[i])) for i in 1:P],
+                        "  dense=",
+                        [(ITensors.dim(w.inds[i]), string(ITensors.tags(w.inds[i])), ITensors.plev(w.inds[i])) for i in P+1:N])
+              else
+                println("   [", lbl, "] storage=", ITensors.has_external_storage(T) ? string(typeof(T.tensor.data)) : "dense")
+              end
+            end
+            println("[FACT_DIAG phi @ b=$b ha=$ha sw=$sw]")
+            _clsdump("psi[b]",   psi[b])
+            _clsdump("psi[b+1]", psi[b+1])
+            _clsdump("phi",      phi)
+            flush(stdout)
           end
 
           # phi = canonicalize_phi_phase(phi)
@@ -655,14 +698,6 @@ function dmrg(
             end
           end
 
-          # println("Starting eigsolve at sweep $sw, half $ha, bond ($b, $(b+1))")
-          # if ITensors.has_external_storage(phi)
-          #   println("Phi has inds ", inds(phi))
-          #   println("external storage information: has_external_storage(phi)=$(ITensors.has_external_storage(phi))")
-          #   println("  storage type: ", typeof(phi), phi)
-          #   println("  unwrapped storage type: ", psi[b])
-          #   println(" unwrapped storage type: ", psi[b+1])
-          # end
 
           # println("eigsolve at sweep $sw, half $ha, bond ($b, $(b+1))")
           time = @elapsed begin
@@ -671,101 +706,261 @@ function dmrg(
               # stable_factorize → L^T L = I → no M correction needed → just
               # use standard Lanczos. Trades nothing if iso_cap doesn't bind.
               if SparseBackends.is_sparse_mps(psi) && get(ENV, "BMF_ISO_PATH", "0") != "1"
-                # Path B (Lanczos / symmetric whitening): B y = E y where
-                # B = M^(-1/2) · H · M^(-1/2), y = M^(1/2) phi.
-                # B is Hermitian AND restricted to image(M) (Linv kills null
-                # space), so :SR robustly returns the true ground state
-                # without spurious zero eigenvalues.
+                # Path B (M-inner-product Lanczos): redefine the Krylov inner
+                # product to <x,y>_M = <x, M·y>. The Lanczos basis is then
+                # M-orthonormal; the eigenvalue problem in this frame is
+                # equivalent to the generalized H v = λ M v. Needs MORE Krylov
+                # vectors than standard Lanczos because the M-inner-product
+                # frame is spectrally harder (M may be near-singular).
                 @timeit PROJMPO_TIMER "dmrg.gram_envs" begin
-                  # Incremental cache: O(1) lookup for Lgram, Rgram.
                   Lgram = SparseBackends.get_left_gram(gram_cache, b)
                   Rgram = SparseBackends.get_right_gram(gram_cache, b)
-                  # Factored: M = Lgram ⊗ Rgram (no shared inds), so
-                  # M^(±1/2) factorizes too. Per-side eigen on small
-                  # (bond_dim_total)² matrices instead of combined
-                  # (bond_dim²)² matrix → orders of magnitude less eigen
-                  # work AND no full M densification.
+                  SparseBackends.schema_dbg("GRAM Lgram b=$b", Lgram)
+                  SparseBackends.schema_dbg("GRAM Rgram b=$b", Rgram)
+                  # Case 4 (aliased ψ × aliased PHP) signal — drives the aliased
+                  # relayout of the M^{−1/2} factors (canonical pre-H apply, no
+                  # forced fission). Case 2 (dense H) ⇒ false ⇒ factors stay dense
+                  # ⇒ byte-identical to before.
+                  # M is built ENTIRELY from ψ (Lgram/Rgram = Σψ·dag(ψ')), so the
+                  # M^{−1/2} factor format should depend only on φ being aliased —
+                  # NOT on H's format. The `any(H[j] aliased)` term was a conservative
+                  # "byte-identical for dense-H" gate, but it leaves the M^{−1/2} apply
+                  # densifying the aliased operand (P=3/dedup→P=2/dense) for dense-H.
+                  # SB_ALIASED_MINV_WRAP_DENSEH=1 drops the H requirement so the wrap
+                  # also fires for dense-H (aliased φ) → operand stays channel-sparse.
+                  _minv_both_aliased = _is_aliased_itensor(phi) &&
+                    (get(ENV, "SB_ALIASED_MINV_WRAP_DENSEH", "0") == "1" ||
+                     any(j -> _is_aliased_itensor(PH.H[j]), site_range(PH)))
                   Mhalf_L, Linv_L, Mhalf_R, Linv_R =
-                    SparseBackends.build_minv_half_pair_factored(Lgram, Rgram; phi_template=phi)
+                    SparseBackends.build_minv_half_pair_factored(Lgram, Rgram; phi_template=phi,
+                                                                 both_aliased=_minv_both_aliased)
                 end
 
-                M_dot = (x, y) -> begin
-                    # M_L · y = Mhalf_L · (Mhalf_L · y)
-                    My = SparseBackends.apply_minv_preserve_bs(Mhalf_L, y,  y)   # M_L^{1/2} · y
-                    My = SparseBackends.apply_minv_preserve_bs(Mhalf_L, My, y)   # M_L^{1/2} · above = M_L · y
-                    # M_R · result = Mhalf_R · (Mhalf_R · result)
-                    My = SparseBackends.apply_minv_preserve_bs(Mhalf_R, My, y)   # M_R^{1/2} · 
-                    My = SparseBackends.apply_minv_preserve_bs(Mhalf_R, My, y)   # M_R^{1/2} · above = M_R ·
-                    return inner(x, My)
-                end
-                phi_wrapped = InnerProductVec(phi, M_dot)
-                # H_op must return a tensor type-identical to phi (same BS
-                # axis order + dims) so KrylovKit's add!! between Krylov basis
-                # vectors works. product(PH, v) goes through contract_preserve_bs
-                # with template=nothing — its BS structure can drift from phi.
-                # Recast Hv back into phi's structure here.
-                H_op = function(v)
-                  Hv = product(PH, v[])
+                # Recast H_eff output back to phi's aliased/BS classification
+                # (schema-preserving alignment), shared by both eigsolve paths.
+                recast_to_phi = function(Hv)
                   if ITensors.has_external_storage(Hv) && ITensors.has_external_storage(phi)
                     Tw = ITensors.get_external_storage(phi)
                     Cw = ITensors.get_external_storage(Hv)
                     if Cw isa SparseBackends.WrappedBlockSparse && Tw isa SparseBackends.WrappedBlockSparse
-                      Hv = ITensors._itensor_from_external_storage(
+                      return ITensors._itensor_from_external_storage(
                           SparseBackends.recast_bs_to_template(Cw, Tw))
+                    elseif Cw isa SparseBackends.WrappedAliasedBlockSparse &&
+                           Tw isa SparseBackends.WrappedAliasedBlockSparse
+                      return ITensors._itensor_from_external_storage(
+                          SparseBackends.recast_aliased_to_template(Cw, Tw))
                     end
                   end
-                  return InnerProductVec(Hv, M_dot)
+                  return Hv
                 end
-                # M-inner-product Lanczos needs MORE Krylov vectors than the
-                # symmetric-whitening B-op variant for the same convergence —
-                # the M-inner-product frame is harder spectrally (M may be
-                # near-singular on the null space of P, no implicit filter).
-                # Match the old B_op floors (krylovdim≥30, maxiter≥10).
+
+                if get(ENV, "BMF_RAYLEIGH_RITZ", "0") == "1"
+                  # ⚠ ARCHIVED / PARKED (2026-06) — default OFF (BMF_RAYLEIGH_RITZ unset).
+                  # Validated correct (matches dense oracle b=1/b=3 ~1e-11; matches B_op
+                  # energy end-to-end at N=4) and stays aliased (plus_dense=0), but ~2.5×
+                  # slower than the default B_op path (extra H-matvecs + fissioned matvec
+                  # input). Parked for later perf work; do NOT enable in benchmarks. See
+                  # README "ARCHIVED: Rayleigh-Ritz". Resume by setting BMF_RAYLEIGH_RITZ=1.
+                  # ── Generalized Rayleigh-Ritz (no M^{±1/2} as a vector op) ────
+                  # Solves H_eff·φ = E·M·φ by projecting onto a small aliased
+                  # Krylov subspace built only from H·v (stays aliased via
+                  # recast_to_phi), forming k×k H_small/M_small with SCALAR inner
+                  # products (M applied with RAW Lgram/Rgram — no square root, no
+                  # BMF_MINV_RTOL), and solving the tiny null-projected generalized
+                  # eig. Ritz vector φ_new = Σ cᵢ vᵢ is an aliased combo of
+                  # φ-schema vectors → stays aliased. Mhalf_*/Linv_* are unused on
+                  # this path (build_minv_half_pair_factored above is wasted work
+                  # here; left running so this branch is a pure add — gate it for
+                  # perf once correctness is proven). BMF_RR_RTOL tunes the k×k
+                  # null cutoff (default 1e-8; far better conditioned than the
+                  # per-side gram, so the aggressive B_op 1e-1 is not needed).
+                  Hop_rr = v -> recast_to_phi(product(PH, v))
+                  rr_rtol = parse(Float64, get(ENV, "BMF_RR_RTOL", "1e-8"))
+                  vals, vecs = SparseBackends.rayleigh_ritz_local_eigsolve(
+                      Hop_rr, phi, Lgram, Rgram;
+                      which     = eigsolve_which_eigenvalue,
+                      tol       = eigsolve_tol,
+                      krylovdim = eigsolve_krylovdim,
+                      maxiter   = eigsolve_maxiter,
+                      rtol      = rr_rtol,
+                      b = b, ha = ha, sw = sw,
+                  )
+                  if get(ENV, "SB_BOND_EIG_DBG", "0") == "1"
+                      println("[BOND_EIG b=", b, " ha=", ha, " sw=", sw, "] RR smallest=", real(vals[1]))
+                      flush(stdout)
+                  end
+                elseif get(ENV, "BMF_BOP_PROJECT", "1") == "1"   # B_op null-projected eigensolve default ON (hardened 2026-06; no-op for canonical M=I)
+                  # ── Option A: null-space-projected symmetric eigensolve ────────
+                  # B = M^{−1/2} · H_eff · M^{−1/2}, solved with the STANDARD inner
+                  # product (plain Lanczos). Linv = M^{−1/2} has null(M) directions
+                  # zeroed (build_half_pair_single rtol cut), so B maps null(M)→0 on
+                  # BOTH sides ⇒ the eigensolve lives entirely on range(M) — the
+                  # genuine independent DOF of the aliased ψ (template sharing makes
+                  # M structurally rank-deficient; iso is unreachable without
+                  # un-deduplicating). This removes the ghost modes and the 1/λ
+                  # blowup that the A=M⁻¹·H_eff + M-inner-product path suffers when M
+                  # is near-singular at large bond dim. Generalized eigenpair recovered
+                  # via φ = M^{−1/2}·y (eigenvalue of B IS the generalized eigenvalue).
+                  # All M^{±1/2} applies go through apply_minv_preserve_bs, which is
+                  # schema-preserving, so (keys, alias_ids, scalars) — i.e. P's action
+                  # — are untouched; only the template values transform.
+                  # NOTE: deferring opL's fission (SB_ALIASED_MINV_DEFER) does NOT work — opL
+                  # (Linv_L) and opR (Linv_R) fission DIFFERENT bonds (left vs right); both are
+                  # required for φ's schema, so skipping opL leaves a mixed classification that
+                  # breaks the factorize. Reducing M⁻¹ cost needs a standalone re-fission op.
+                  apply_half = function(opL, opR, z; fission::Bool=true)
+                    z = SparseBackends.apply_minv_preserve_bs(opL, z, phi; fission)
+                    z = SparseBackends.apply_minv_preserve_bs(opR, z, phi; fission)
+                    return z
+                  end
+                  # Deferred-fission on the PRE-H apply_half (HARDENED 2026-06): its output
+                  # is consumed only by product(PH,·), which re-establishes φ's schema
+                  # internally (matvec hint-lastonly), so the M^{−1/2}y intermediate need
+                  # not be fissioned to φ's classification. Both sides skip fission together
+                  # (uniform big-block — no mixed L/R classification, unlike the earlier
+                  # opL-only attempt that errored, see comment above). The POST-H apply_half
+                  # keeps fission=true: its result is a Krylov vector and must match y0's (φ)
+                  # schema for eigsolve. Validated bit-identical E (-17.16104, N=12 md=40)
+                  # with a 2.06× steady-state per-sweep speedup (4.58s→2.22s): big-block x
+                  # also lets the matvec itself run big-block GEMMs (matvec cpb 35.0→24.9s).
+                  # NOTE (case 4, aliased ψ × aliased PHP): the fission=false big-block x
+                  # is now safe because the M^{−1/2} factors are relayout-wrapped aliased
+                  # (SB_ALIASED_MINV_WRAP, see build_minv_half_pair_factored) so x stays
+                  # canonical (channel in prefix) and matches the aliased env. Case 2
+                  # (dense H) keeps dense factors. No special-casing needed here.
+                  # ── ENV-DRESSING (Path-B, dense-env case) ──────────────────────
+                  # Fold M^{−1/2}=Linv into BOTH link legs of the (dense) L/R envs ONCE
+                  # per bond, so B = M^{−1/2} H M^{−1/2} becomes a SINGLE matvec with no
+                  # per-iteration apply_half. M=Lgram⊗Rgram is an outer product → Linv_L
+                  # hits only the left link (= Lenv's ket/bra legs), Linv_R only the right
+                  # (= Renv's legs). Lenv=[l(0),h,l(1)]; dressing the ket-link (l plev0) is
+                  # the input-side M^{−1/2}, dressing the bra-link (l plev1, the output leg)
+                  # is the output-side M^{−1/2}. plev-2 temporaries avoid colliding with the
+                  # env's own bra-link (same bond Index at plev 0/1). Exact re-association of
+                  # the current B_op; PH.LR is saved/restored (the env cache is assumed
+                  # immutable by _makeL!/_makeR!). Gated on the EXISTING classification: this
+                  # plain dense `env * Linv` dressing is valid only when the envs are dense
+                  # (aliased ψ on bare/dense H, i.e. !_minv_both_aliased). Both-aliased
+                  # (aliased PHP) has wrapped envs needing contract_preserve_bs → deferred;
+                  # it falls through to the apply_half path below. y0 / recovery still pay
+                  # one M^{1/2} / M^{−1/2} per eigsolve.
+                  _lpos, _rpos = PH.lpos, PH.rpos
+                  _L0 = (1 <= _lpos <= length(PH.LR) && isassigned(PH.LR, _lpos)) ? PH.LR[_lpos] : nothing
+                  _R0 = (1 <= _rpos <= length(PH.LR) && isassigned(PH.LR, _rpos)) ? PH.LR[_rpos] : nothing
+                  _env_dress = !_minv_both_aliased &&
+                               (_L0 === nothing || !ITensors.has_external_storage(_L0)) &&
+                               (_R0 === nothing || !ITensors.has_external_storage(_R0))
+                  if _env_dress
+                    _dress_env = function(env, Linv)
+                      Lk  = ITensors.replaceprime(Linv, 1 => 2)            # [l(0), l(2)]
+                      env = ITensors.replaceprime(env * Lk, 2 => 0; tags = "Link")  # contract l(0); l(2)→l(0)
+                      Lb  = ITensors.replaceprime(Linv, 0 => 2)            # [l(2), l(1)]
+                      env = ITensors.replaceprime(env * Lb, 2 => 1; tags = "Link")  # contract l(1); l(2)→l(1)
+                      return env
+                    end
+                    try
+                      (_L0 isa ITensor) && (PH.LR[_lpos] = _dress_env(_L0, Linv_L))
+                      (_R0 isa ITensor) && (PH.LR[_rpos] = _dress_env(_R0, Linv_R))
+                      # DENSE LOCAL SOLVE: the operand is dedup=1 the instant M^{1/2} is
+                      # applied (measured: eigsolve operand→result dedup 2.0→1.0, keys
+                      # preserved), so the aliased wrapper buys nothing during the solve —
+                      # the Lanczos dots/adds just hit the wrapped×wrapped densify-fallback
+                      # (9 s / 17.6 GiB). Run the whole local solve in PLAIN DENSE ITensors
+                      # (dense BLAS dots), then re-impose φ's keys on the recovered
+                      # eigenvector via wrap_dense_as_aliased_via_template — this reproduces
+                      # the current dedup=1+keys eigsolve-RESULT exactly, so replacebond!'s
+                      # channel-aware SVD re-derives dedup losslessly as before.
+                      B_op = y -> recast_to_phi(product(PH, y))  # dense in → dense out (folded M^{−1/2}HM^{−1/2})
+                      y0 = SparseBackends.to_dense_itensors_unfused(
+                               apply_half(Mhalf_L, Mhalf_R, phi))  # y0 = M^{1/2} φ, densified
+                      vals, yvecs = eigsolve(
+                          B_op, y0, 1, eigsolve_which_eigenvalue;
+                          ishermitian = true,
+                          tol         = eigsolve_tol,
+                          krylovdim   = eigsolve_krylovdim,
+                          maxiter     = eigsolve_maxiter,
+                          verbosity   = eigsolve_verbosity,
+                      )
+                      # φ = M^{−1/2} y (dense), then re-alias to φ's keys (dedup=1) so the
+                      # channel-aware factorize at replacebond! rebuilds dedup.
+                      vecs = [SparseBackends.wrap_dense_as_aliased_via_template(
+                                  apply_half(Linv_L, Linv_R, y), phi) for y in yvecs]
+                    finally
+                      (_L0 isa ITensor) && (PH.LR[_lpos] = _L0)
+                      (_R0 isa ITensor) && (PH.LR[_rpos] = _R0)
+                    end
+                  else
+                  B_op = function(y)
+                    x  = apply_half(Linv_L, Linv_R, y; fission = false)  # M^{−1/2} y (big-block)
+                    Hx = recast_to_phi(product(PH, x))         # H_eff M^{−1/2} y
+                    return apply_half(Linv_L, Linv_R, Hx)      # M^{−1/2} H_eff M^{−1/2} y
+                  end
+                  y0 = apply_half(Mhalf_L, Mhalf_R, phi)       # y0 = M^{1/2} φ
+                  if get(ENV, "SB_PHI_Y0_DEDUP", "0") == "1"
+                    println("\n===== [SB_PHI_Y0_DEDUP b=", b, " ha=", ha, " sw=", sw,
+                            "] does M^{1/2} preserve φ's dedup? =====")
+                    _dump_aliased_schema("phi          ", phi; max_blocks=0)
+                    _dump_aliased_schema("y0=M^1/2 phi ", y0;  max_blocks=0)
+                    flush(stdout)
+                  end
+                  vals, yvecs = eigsolve(
+                      B_op, y0, 1, eigsolve_which_eigenvalue;
+                      ishermitian = true,
+                      tol         = eigsolve_tol,
+                      krylovdim   = eigsolve_krylovdim,
+                      maxiter     = eigsolve_maxiter,
+                      verbosity   = eigsolve_verbosity,
+                  )
+                  vecs = [apply_half(Linv_L, Linv_R, y) for y in yvecs]   # φ = M^{−1/2} y
+                  end
+                  if get(ENV, "SB_BOND_EIG_DBG", "0") == "1"
+                      println("[BOND_EIG b=", b, " ha=", ha, " sw=", sw, "] B_op smallest=", real(vals[1]),
+                              "  Mrank-ok? Linv built; <phi|phi>=", round(real(inner(phi, phi)); digits=6))
+                      flush(stdout)
+                  end
+                else
+                # Path B (M-inner-product Lanczos): redefine the Krylov inner
+                # product to <x,y>_M = <x, M·y>.
+                M_dot = (x, y) -> begin
+                    # M · y via factored: M = (Mhalf_L · Mhalf_L) · (Mhalf_R · Mhalf_R)
+                    My = SparseBackends.apply_minv_preserve_bs(Mhalf_L, y,  y)
+                    My = SparseBackends.apply_minv_preserve_bs(Mhalf_L, My, y)
+                    My = SparseBackends.apply_minv_preserve_bs(Mhalf_R, My, y)
+                    My = SparseBackends.apply_minv_preserve_bs(Mhalf_R, My, y)
+                    return inner(x, My)
+                end
+                phi_wrapped = InnerProductVec(phi, M_dot)
+                # Apply M⁻¹ to z (= Linv_L² ⊗ Linv_R², since Linv = M^(−1/2)),
+                # preserving z's sparse storage / classification against phi.
+                apply_Minv = z -> begin
+                    z = SparseBackends.apply_minv_preserve_bs(Linv_L, z, phi)
+                    z = SparseBackends.apply_minv_preserve_bs(Linv_L, z, phi)
+                    z = SparseBackends.apply_minv_preserve_bs(Linv_R, z, phi)
+                    z = SparseBackends.apply_minv_preserve_bs(Linv_R, z, phi)
+                    return z
+                end
+                # A = M⁻¹·H_eff is the M-self-adjoint operator whose M-inner-product
+                # Lanczos returns the generalized eigenvalues. Fragile when M is
+                # near-singular (use BMF_BOP_PROJECT=1 for the robust variant above).
+                apply_minv_correction = get(ENV, "BMF_APPLY_MINV", "1") != "0"
+                H_op = function(v)
+                  Hv = recast_to_phi(product(PH, v[]))
+                  Av = apply_minv_correction ? apply_Minv(Hv) : Hv
+                  return InnerProductVec(Av, M_dot)
+                end
                 vals, vecs = eigsolve(
                     H_op,
                     phi_wrapped,
                     1,
                     eigsolve_which_eigenvalue;
-                    ishermitian = true,
-                    tol          = eigsolve_tol,
-                    krylovdim    = max(eigsolve_krylovdim, 30),
-                    maxiter      = max(eigsolve_maxiter, 10),
-                    verbosity    = eigsolve_verbosity,
+                    ishermitian = get(ENV, "BMF_ARNOLDI", "0") != "1",
+                    tol         = eigsolve_tol,
+                    krylovdim   = eigsolve_krylovdim,
+                    maxiter     = eigsolve_maxiter,
+                    verbosity   = eigsolve_verbosity,
                 )
-
-                # unwrap eigenvectors — no back-transform needed
                 vecs = [v[] for v in vecs]
-
-
-                # # y = M^(1/2) phi = Mhalf_L · Mhalf_R · phi (applied per-side).
-                # phi_y = SparseBackends.apply_minv_preserve_bs(Mhalf_L, phi, phi)
-                # phi_y = SparseBackends.apply_minv_preserve_bs(Mhalf_R, phi_y, phi)
-                # B_op = function (y)
-                #   phi_x = SparseBackends.apply_minv_preserve_bs(Linv_L, y, y)
-                #   phi_x = SparseBackends.apply_minv_preserve_bs(Linv_R, phi_x, y)
-                #   Hphi  = product(PH, phi_x)
-                #   z = SparseBackends.apply_minv_preserve_bs(Linv_L, Hphi, y)
-                #   z = SparseBackends.apply_minv_preserve_bs(Linv_R, z, y)
-                #   return z
-                # end
-                # vals, vecs = eigsolve(
-                #   B_op,
-                #   phi_y,
-                #   1,
-                #   eigsolve_which_eigenvalue;
-                #   ishermitian=false,
-                #   tol=eigsolve_tol,
-                #   krylovdim=max(eigsolve_krylovdim, 30),
-                #   maxiter=max(eigsolve_maxiter, 10),
-                #   verbosity=eigsolve_verbosity,
-                # )
-                # vecs = [
-                #   let
-                #     x1 = SparseBackends.apply_minv_preserve_bs(Linv_L, y, y)
-                #     SparseBackends.apply_minv_preserve_bs(Linv_R, x1, y)
-                #   end
-                #   for y in vecs
-                # ]
+                end
               else
                 vals, vecs = eigsolve(
                   PH,
@@ -795,6 +990,12 @@ function dmrg(
             adapt(ITensors.set_eltype(unwrap_array_type(phi), eltype(vecs[1])), vecs[1])
           else
             vecs[1]
+          end
+          SparseBackends.schema_dbg("eigsolve-RESULT phi b=$b", phi)
+          if get(ENV, "SB_ALIASED_TRACE", "0") == "1" && _EIGSOLVE_PHI_TRACE_COUNT[] < 5
+            _EIGSOLVE_PHI_TRACE_COUNT[] += 1
+            phi_st = ITensors.has_external_storage(phi) ? typeof(phi.tensor.data) : "dense"
+            println("[SB_ALIASED_TRACE eigsolve returned #$(_EIGSOLVE_PHI_TRACE_COUNT[])]  phi storage=$phi_st  b=$b")
           end
 
           if debug_tracking()
@@ -848,6 +1049,8 @@ function dmrg(
               )
             end
           end
+          SparseBackends.schema_dbg("replacebond-OUT psi[$b]", psi[b])
+          SparseBackends.schema_dbg("replacebond-OUT psi[$(b+1)]", psi[b+1])
 
           # println("================ print here ================ ", ITensors.has_external_storage(phi))
 
