@@ -12,6 +12,52 @@ import SparseBackends
 # module scope so it's resolved once, not in the inner dmrg loop.
 VectorInterface.scalartype(::Type{ITensors.ITensor}) = ComplexF64
 
+# In-place aliased Lanczos add!! — the ITensorsVectorInterfaceExt extension runs
+# `a + b*α` directly for external storage (two allocations: the b*α template copy
+# + the Base.:+ `plus_merge` result — the dominant aliased-Krylov add cost). For
+# key-aligned dedup-1 aliased operands we do a truly in-place axpby (zero alloc,
+# no merge). To OVERRIDE the extension WITHOUT a precompile "method overwriting"
+# error, the methods below are strictly MORE SPECIFIC than the extension's
+# add!!(…, ::Number): ::Real and ::Complex cover every concrete α Lanczos produces
+# (the complex one is the 2-arg add!!'s one(ComplexF64)). HARDENED: the in-place
+# path is unconditional; it falls back to the extension's exact behavior only when
+# operands aren't key-aligned aliased storage ⇒ byte-identical in that case.
+function _aliased_addbang!(a::ITensors.ITensor, b::ITensors.ITensor, α::Number, β::Number)
+  # HARDENED: the in-place aliased axpby is always attempted (it's bit-identical
+  # and strictly faster); it falls through below only when the operands aren't
+  # key-aligned aliased storage — a correctness condition, not a toggle.
+  SparseBackends._ADD_INPLACE_TRY[] += 1
+  awa = SparseBackends._alias_storage(a); bwa = SparseBackends._alias_storage(b)
+  if awa !== nothing && bwa !== nothing &&
+     SparseBackends._alias_inplace_axpby!(awa, bwa, α, β)
+    return a
+  end
+  SparseBackends._ADD_INPLACE_FAIL[] += 1
+  if ITensors.has_external_storage(a)
+    result = a * β + b * α
+    a.tensor = result.tensor
+    return a
+  end
+  if promote_type(eltype(a), eltype(b), typeof(α), typeof(β)) <: eltype(a)
+    return VectorInterface.add!(a, b, α, β)
+  end
+  return a * β + b * α
+end
+VectorInterface.add!!(a::ITensors.ITensor, b::ITensors.ITensor, α::Real) =
+  _aliased_addbang!(a, b, α, one(α))
+VectorInterface.add!!(a::ITensors.ITensor, b::ITensors.ITensor, α::Complex) =
+  _aliased_addbang!(a, b, α, one(α))
+VectorInterface.add!!(a::ITensors.ITensor, b::ITensors.ITensor, α::Real, β::Real) =
+  _aliased_addbang!(a, b, α, β)
+VectorInterface.add!!(a::ITensors.ITensor, b::ITensors.ITensor, α::Complex, β::Complex) =
+  _aliased_addbang!(a, b, α, β)
+# NOTE: the analogous Lanczos `inner` (the `wrapped×wrapped` dots) cannot be
+# overridden the same way — its signature inner(::ITensor,::ITensor) is identical
+# to the extension's with no more-specific variant, and an __init__/@eval install
+# breaks the ChainRulesCore extension's precompile. The dot speedup will instead
+# be done at the SparseBackends contraction level (full aliased×aliased reduction
+# → scalar). For now `inner` keeps the extension's contraction path.
+
 function naive_overlap(psi1::MPS, psi2::MPS)
   psi1dag = dag(psi1)
   # ITensors.replaceprime!(psi1dag, 0 => 1)  # match primes
@@ -212,170 +258,6 @@ merge_t1_to_match_t2(T1::ITensor, T2::ITensor)::ITensor = merge_t2_to_match_t1(T
 #   end
 # end
 
-debug_tracking() = get(ENV, "DEBUG_TRACKING", "") ∉ ("", "0", "false")
-
-phi_tracker = Dict{Int,ITensor}()  # position → stored phi from run 1
-phi_tracker2 = Dict{Int,ITensor}()
-hphi_tracker = Dict{Int,ITensor}()  # position → stored PH*phi from run 1
-bond2_tracker = Dict{String,ITensor}()  # sw==1,b==2,ha==1 intermediates from run 1
-
-function compare_data(phi, old_phi, b, sw, string)
-  t1 = ITensors.has_external_storage(phi)     ? SparseBackends.to_dense_itensors(phi)     : phi
-  t2 = ITensors.has_external_storage(old_phi) ? SparseBackends.to_dense_itensors(old_phi) : old_phi
-  i1_list = collect(inds(t1))
-  i2_list = collect(inds(t2))
-  ids1 = Set(ITensors.id(i) for i in i1_list)
-  ids2 = Set(ITensors.id(i) for i in i2_list)
-  if ids1 == ids2
-    t2_aligned = t2
-  else
-    # Some link indices have different IDs across runs — remap by matching tag+dim,
-    # but only for indices in t2 that have no ID match in t1
-    idx_map = Index[]
-    idx_replacement = Index[]
-    used = falses(length(i1_list))
-    for i2 in i2_list
-      ITensors.id(i2) in ids1 && continue  # already exists in t1, no remap needed
-      matched = findfirst(j -> !used[j] && dim(i1_list[j]) == dim(i2) && hastags(i1_list[j], tags(i2)), 1:length(i1_list))
-      if !isnothing(matched)
-        used[matched] = true
-        push!(idx_map, i2)
-        push!(idx_replacement, i1_list[matched])
-      end
-    end
-    t2_aligned = isempty(idx_map) ? t2 : replaceinds(t2, idx_map, idx_replacement)
-  end
-  a1 = Array(t1, i1_list...)
-  a2 = Array(t2_aligned, i1_list...)
-  n1 = sqrt(sum(abs2, a1))
-  n2 = sqrt(sum(abs2, a2))
-  ovlp = abs(dot(vec(a1), vec(a2)))
-  fidelity = ovlp / (n1 * n2)
-  diff = a1 .- a2
-  diff_norm = sqrt(sum(abs2, diff))
-  diff_max = maximum(abs, diff)
-  diff_sum = sum(abs, diff)
-  println("   Sweep [$sw], comp. $string  phi[$b] ‖Δ‖=$(round(diff_norm, sigdigits=4))  max|Δ|=$(round(diff_max, sigdigits=4))  Σ|Δ|=$(round(diff_sum, sigdigits=4))  fidelity=$(round(fidelity, sigdigits=8))")
-end
-
-
-function check_phi!(phi, b, sw, ha; only_store=false)
-  key = (sw - 1) * 1000 + ha * 100 + b
-  if only_store
-    haskey(phi_tracker, key) && println("WARNING replacing tracker data")
-    phi_tracker[key] = deepcopy(phi)
-  elseif haskey(phi_tracker, key)
-    compare_data(phi, phi_tracker[key], b, sw, "phi")
-  end
-end
-
-# Compare a tensor against the run-1 stored copy (in `bond2_tracker`) using
-# the same align-by-(tag,dim) + dense-array diff as `compare_data`.
-function compare_bond2(t::ITensor, name::String)
-  haskey(bond2_tracker, name) || return
-  old = bond2_tracker[name]
-  t1 = ITensors.has_external_storage(t)   ? SparseBackends.to_dense_itensors(t)   : t
-  t2 = ITensors.has_external_storage(old) ? SparseBackends.to_dense_itensors(old) : old
-  t2_aligned = align_links(t1, t2, name)
-  if isnothing(t2_aligned)
-    println("  bond2[$name]: align_links failed; inds(t1)=$(inds(t1))  inds(t2)=$(inds(t2))")
-    return
-  end
-  i1 = collect(inds(t1))
-  a1 = Array(t1, i1...)
-  a2 = Array(t2_aligned, i1...)
-  d  = a1 .- a2
-  println("  bond2[$name]  ‖Δ‖=", round(norm(d); sigdigits=4),
-                          "  max|Δ|=", round(maximum(abs, d); sigdigits=4),
-                          "  Σ|Δ|=", round(sum(abs, d); sigdigits=4))
-end
-
-# Dump environment tensors and product()-step intermediates at sweep 1 bond 2,
-# half-sweep 1. On only_store=true (run 1, dense H) it stashes into bond2_tracker;
-# on only_store=false (run 2, sparse H) it diffs against the stored copies.
-# Called immediately after `PH = position!(PH, psi, b)`.
-function bond2_diag!(PH, psi, b, sw, ha; only_store=false)
-  (sw == 1 && b == 2 && ha == 1) || return
-  println("===== bond2 diagnostic dump (sw=$sw, b=$b, ha=$ha) =====")
-
-  function record!(name::String, T::ITensor)
-    if only_store
-      bond2_tracker[name] = deepcopy(T)
-    else
-      compare_bond2(T, name)
-    end
-  end
-
-  # 1) cached environments built up to bond 2
-  isassigned(PH.LR, 1) && record!("LR[1]", PH.LR[1])
-  N = length(PH.H)
-  isassigned(PH.LR, 3) && 3 <= N && record!("LR[3]", PH.LR[3])
-  isassigned(PH.LR, 4) && 4 <= N && record!("LR[4]", PH.LR[4])
-
-  # 2) Step-by-step build of `lproj * H[b] * H[b+1] * rproj`,
-  # mirroring `contract(P::AbstractProjMPO, v::ITensor)` so we can locate
-  # which sequential `*` first introduces the e-14 noise.
-  Lp = ITensorMPS.lproj(PH)
-  Rp = ITensorMPS.rproj(PH)
-  if !(Lp isa ITensorMPS.OneITensor)
-    record!("lproj_input", Lp)
-  end
-  if !(Rp isa ITensorMPS.OneITensor)
-    record!("rproj_input", Rp)
-  end
-
-  step = Lp
-  Hsites = collect(ITensorMPS.site_range(PH))
-  for (i, s) in enumerate(Hsites)
-    record!("H[$s]_raw", PH.H[s])
-    step = step * PH.H[s]
-    record!("after_L*H[$s]", step)
-  end
-  step = step * Rp
-  record!("after_*R", step)
-
-  # 3) Apply phi to compare the final tensor before noprime
-  phi = psi[b] * psi[b+1]
-  record!("phi", phi)
-  hphi_raw = step * phi
-  record!("hphi_pre_noprime", hphi_raw)
-  hphi = noprime(hphi_raw)
-  record!("hphi_final", hphi)
-
-  println("===== end bond2 diagnostic dump =====")
-end
-
-function check_equality!(tensor_tracker, PH, psi; only_store=false, only_idx=nothing)
-  if only_store
-    push!(tensor_tracker, (deepcopy(PH), deepcopy(psi)))
-    @assert length(tensor_tracker) === only_idx
-  elseif only_idx <= length(tensor_tracker)
-    # compare current and old projection MPOs
-    PH_old = tensor_tracker[only_idx][1]
-    println("Comparing current and old projection MPOs...")
-    stop = false
-    psi_old = tensor_tracker[only_idx][2]
-    total_sq = 0.0
-    for i in 1:length(psi)
-      t1 = ITensors.has_external_storage(psi[i])     ? SparseBackends.to_dense_itensors(psi[i])     : psi[i]
-      t2 = ITensors.has_external_storage(psi_old[i]) ? SparseBackends.to_dense_itensors(psi_old[i]) : psi_old[i]
-      t2_aligned = align_links(t1, t2, "psi[$i]")
-      if !isnothing(t2_aligned)
-        diff = t1 - t2_aligned
-        diff_norm = norm(diff)
-        total_sq += diff_norm^2
-        if !isapprox(t1, t2_aligned)
-          println("  psi[$i] ✗ ‖Δ‖ = $diff_norm")
-          stop = true
-        end
-        psi[i] = t2_aligned
-      end
-    end
-    direct_norm = sqrt(total_sq)
-    println("    at step $only_idx -> ‖psi - psi_old‖ (element-wise) = $direct_norm")
-  end
-end
-
 function canonicalize_phi_phase(phi::ITensor; atol=1e-12)
     arr     = array(phi)
     arr_abs = abs.(arr)
@@ -515,8 +397,19 @@ function dmrg(
   eigsolve_which_eigenvalue=:SR,
   ishermitian=true,
   tensor_tracker=nothing,
-  only_store=false
+  only_store=false,
+  # Eigensolve PATHWAY selector (replaces the old BMF_ISO_PATH / BMF_BOP_PROJECT /
+  # BMF_APPLY_MINV / BMF_ARNOLDI env flags + the implicit _env_dress densify gate).
+  # Applies only when is_sparse_mps(psi); dense ψ skips Path-B structurally.
+  #   :iso         — standard Lanczos, M=I (sparse-but-isometric ψ; e.g. BS strict-cap SVD)
+  #   :bop_aliased — B = M^{-1/2} H M^{-1/2}, null-projected, seed/Krylov stay ALIASED (no densify)
+  #   :bop_densify — same B_op but env-dressed + DENSIFIED seed (needs dense L/R envs)
+  #   :minner      — A = M^{-1} H_eff, M-inner-product Lanczos
+  run_mode::Symbol=:bop_aliased,
+  debug=false
 )
+  run_mode in (:iso, :bop_aliased, :bop_densify, :minner) ||
+    error("dmrg: unknown run_mode=$(run_mode); expected one of :iso, :bop_aliased, :bop_densify, :minner")
   println("Use early exit is set to ", use_early_exit, " num sweeeps are ", nsweep(sweeps))
   if length(psi0) == 1
     error(
@@ -569,9 +462,6 @@ function dmrg(
   pos_time = 0.0
   opt_time = 0.0
   only_idx = 1
-  if debug_tracking()
-    check_equality!(tensor_tracker, PH, psi; only_store=only_store, only_idx=only_idx)
-  end
 
   # Path-B gram-env cache: incremental L[i], R[i] for sparse psi.
   # Built once here, then updated per replacebond! step (one contraction
@@ -620,20 +510,13 @@ function dmrg(
           end
           pos_time += timer
 
-          # Bond-2 sweep-1 diagnostic dump (gated inside bond2_diag!)
-          if debug_tracking()
-            bond2_diag!(PH, psi, b, sw, ha; only_store=only_store)
-          end
-
           @debug_check begin
             checkflux(psi)
             checkflux(PH)
           end
 
           @timeit_debug timer "dmrg: psi[b]*psi[b+1]" begin
-            # Aliased psi: preserve aliased output so the factorize gets an
-            # aliased phi. Otherwise the default `*` falls into the
-            # Aliased×Aliased BS fallback and crashes.
+            # Manually preserve the aliased output if both inputs are aliased blocksparse 
             phi = if ITensors.has_external_storage(psi[b]) &&
                      ITensors.has_external_storage(psi[b + 1]) &&
                      psi[b].tensor.data isa SparseBackends.WrappedAliasedBlockSparse &&
@@ -646,6 +529,25 @@ function dmrg(
               psi[b] * psi[b + 1]
             end
           end
+          # WRAP-AROUND (Part B): put φ (the eigensolver seed + recast template)
+          # into the order the matvec's FIRST step wants, so step-1's permA is the
+          # identity every Krylov iteration. The first operator is lproj (Lenv) in
+          # the bulk/right-edge chain, or rproj (Renv) at the left edge where the
+          # chain reverses. Layout-only — contraction math unchanged.
+          if SparseBackends.is_sparse_mps(psi) && run_mode !== :iso
+            # φ (eigensolver seed + recast template) reordered ONCE per bond by the
+            # matvec-chain reduction rank, so step-1's permA is the identity every
+            # Krylov iteration. φ's raw `psi[b]*psi[b+1]` shape is bond-specific (so
+            # this can't be a single hard-coded vector like the per-step output
+            # table), but it's a once-per-bond template setup, not per-matvec. Build
+            # the chain via the same reverse gate the matvec uses.
+            _ops = Union{ITensor,OneITensor}[lproj(PH)]
+            for s in site_range(PH); push!(_ops, PH.H[s]); end
+            push!(_ops, rproj(PH))
+            (first(_ops) isa OneITensor) && reverse!(_ops)
+            phi = SparseBackends.reorder_aliased_by_rank(phi, _ops)
+          end
+
           SparseBackends.schema_dbg("eigsolve-OPERAND phi b=$b", phi)
 
           if get(ENV, "SB_FACT_DIAG", "0") == "1"
@@ -669,43 +571,50 @@ function dmrg(
 
           # phi = canonicalize_phi_phase(phi)
 
-          if debug_tracking()
-            # if sw > 2
-            check_phi!(phi, b, sw, ha; only_store=only_store)
-            # end
-            if !only_store
-              key = (sw - 1) * 1000 + ha * 100 + b
-              old_phi = phi_tracker[key]
-              # println("Aligning old phi inds to new phi inds: ", inds(old_phi), " -> ", inds(phi))
-              phi_aligned = align_links(phi, old_phi, "phi_tracker")
-              @assert !isnothing(phi_aligned) "align_links failed for phi_tracker at b=$b sw=$sw ha=$ha: inds(phi)=$(inds(phi)) inds(old_phi)=$(inds(old_phi))"
-              # phi = phi_aligned
-              compare_data(phi, old_phi, b, sw, "phi--")
-            end
-            # check_phi!(phi, b, sw, ha; only_store=only_store)
+          # TRACE_IMAGE: capture the TRUE φ's constraint image (before M^{±1/2}) so the
+          # per-step matvec trace can flag intermediate keys outside image(φ).
+          SparseBackends.capture_phi_image!(phi)
 
-            # Single PH*phi application to isolate contraction bug from Krylov accumulation
-            let hphi = product(PH, phi), key = (sw - 1) * 1000 + ha * 100 + b
-              if only_store
-                hphi_tracker[key] = deepcopy(hphi)
-              elseif haskey(hphi_tracker, key)
-                stored = hphi_tracker[key]
-                stored_aligned = align_links(hphi, stored, "hphi")
-                if !isnothing(stored_aligned)
-                  compare_data(hphi, stored_aligned, b, sw, "hphi")
-                end
-              end
+          # ── KEYTRACE (SB_KEYTRACE=1): trace the prefix-key set + index order at each
+          # stage of one bond (default b=2, sw=1, ha=1) to follow the M^{±1/2} key flow.
+          _keytrace = function(lbl, T)
+            _kt_bonds = Set(parse.(Int, split(get(ENV, "SB_KEYTRACE_BOND", "2"), ",")))
+            (get(ENV, "SB_KEYTRACE", "0") == "1" &&
+             (b in _kt_bonds) && sw == 1 && ha == 1) || return nothing
+            if T isa ITensors.ITensor && ITensors.has_external_storage(T) &&
+               ITensors.get_external_storage(T) isa SparseBackends.WrappedAliasedBlockSparse
+              w = ITensors.get_external_storage(T); a = w.aliased
+              P = SparseBackends._abs_head_len(w); Nn = length(w.inds)
+              _ord = [(ITensors.dim(w.inds[i]), string(ITensors.tags(w.inds[i])), ITensors.plev(w.inds[i])) for i in 1:Nn]
+              _dedup = round(length(a.keys) / max(a.n_templates, 1); digits=3)
+              # key → alias_id (template index) pairs, so the actual dedup GROUPING is visible:
+              _keymap = [(a.keys[i], Int(a.alias_ids[i])) for i in eachindex(a.keys)]
+              # group keys by template id to show which keys SHARE each template
+              _bytmpl = Dict{Int,Vector{eltype(a.keys)}}()
+              for i in eachindex(a.keys); push!(get!(_bytmpl, Int(a.alias_ids[i]), eltype(a.keys)[]), a.keys[i]); end
+              println("[KEYTRACE b=", b, " ", lbl, "] P=", P, " nb=", length(a.keys), " nt=", a.n_templates,
+                      " dedup=", _dedup, "x",
+                      "\n   inds(order)= ", _ord,
+                      "\n   sparse_prefix(1:P)= ", _ord[1:P],
+                      "\n   key=>template_id= ", _keymap,
+                      "\n   keys_sharing_each_template= ", sort(collect(_bytmpl)))
+            else
+              _st = (T isa ITensors.ITensor && ITensors.has_external_storage(T)) ?
+                    string(typeof(ITensors.get_external_storage(T))) : "dense/plain"
+              println("[KEYTRACE ", lbl, "] (", _st, ")")
             end
+            flush(stdout); return nothing
           end
-
+          _keytrace("1.phi_original (template)", phi)
 
           # println("eigsolve at sweep $sw, half $ha, bond ($b, $(b+1))")
           time = @elapsed begin
             @timeit PROJMPO_TIMER "dmrg.eigsolve" begin
-              # BMF_ISO_PATH=1: psi is sparse AND we enforce strict iso SVD in
-              # stable_factorize → L^T L = I → no M correction needed → just
-              # use standard Lanczos. Trades nothing if iso_cap doesn't bind.
-              if SparseBackends.is_sparse_mps(psi) && get(ENV, "BMF_ISO_PATH", "0") != "1"
+              # run_mode === :iso: ψ is treated as isometric (strict-iso SVD in
+              # stable_factorize → L^T L = I → M = I → no M correction) → just use
+              # standard Lanczos. Dense ψ also lands in the standard-eigsolve fall-
+              # through structurally (is_sparse_mps == false), regardless of run_mode.
+              if SparseBackends.is_sparse_mps(psi) && run_mode !== :iso
                 # Path B (M-inner-product Lanczos): redefine the Krylov inner
                 # product to <x,y>_M = <x, M·y>. The Lanczos basis is then
                 # M-orthonormal; the eigenvalue problem in this frame is
@@ -717,6 +626,81 @@ function dmrg(
                   Rgram = SparseBackends.get_right_gram(gram_cache, b)
                   SparseBackends.schema_dbg("GRAM Lgram b=$b", Lgram)
                   SparseBackends.schema_dbg("GRAM Rgram b=$b", Rgram)
+                  # SB_GRAM_DUMP=1: print Lgram/Rgram as dense matrices to SEE the channel
+                  # coupling (off-diagonal = M mixes channels = source of forbidden combos).
+                  if get(ENV, "SB_GRAM_DUMP", "0") == "1" &&
+                     (b in Set(parse.(Int, split(get(ENV,"SB_GRAM_DUMP_BOND","2"),",")))) && ha == 1
+                    _gdump = function(lbl, G)
+                      gi = collect(ITensors.inds(G))
+                      if isempty(gi); println("[GRAM_DUMP ", lbl, "] scalar/empty"); flush(stdout); return; end
+                      unp = filter(I->ITensors.plev(I)==0, gi); prm = filter(I->ITensors.plev(I)==1, gi)
+                      Gd = ITensors.has_external_storage(G) ? SparseBackends.to_dense_itensors_unfused(G) : G
+                      d = prod(I->ITensors.dim(I), unp; init=1)
+                      arr = reshape(Array(Gd, unp..., prm...), d, d)
+                      # eigenvalue spectrum (compact rank-deficiency readout — works for large d)
+                      ev = sort(real.(LinearAlgebra.eigvals(LinearAlgebra.Hermitian((arr+arr')/2))); rev=true)
+                      mx = isempty(ev) ? 0.0 : maximum(ev)
+                      rnk = count(>(1e-8*max(mx,eps())), ev)
+                      println("[GRAM_DUMP ", lbl, "]  dim=", d, "x", d,
+                              "  unp_inds= ", [(ITensors.dim(I), string(ITensors.tags(I))) for I in unp],
+                              "\n   eigenvalues(desc)= ", [round(e; sigdigits=3) for e in ev],
+                              "\n   numerical_rank(>1e-8·max)= ", rnk, " / ", d,
+                              "   (null dim = ", d-rnk, ")")
+                      # SEPARABILITY: is G[a1,a2,a1',a2'] ≈ A[a1,a1'] ⊗ B[a2,a2'] for the two
+                      # link axes (one is the sparse CHANNEL, one the dense MULT)? Reshape to
+                      # (a1,a1')×(a2,a2') and SVD: top-singular-value² fraction = how separable.
+                      # Then test whether either factor ≈ proportional to identity (= "contributes
+                      # little" / trivial). unp order is [first, second]; we label by dim.
+                      if length(unp) == 2
+                        d1 = ITensors.dim(unp[1]); d2 = ITensors.dim(unp[2])
+                        G4 = reshape(arr, d1, d2, d1, d2)             # [a1,a2,a1',a2']
+                        Msep = reshape(permutedims(G4, (1,3,2,4)), d1*d1, d2*d2)  # [(a1,a1'),(a2,a2')]
+                        Fsep = LinearAlgebra.svd(Msep)
+                        sv = Fsep.S
+                        sep_frac = sv[1]^2 / max(sum(abs2, sv), eps())
+                        # extract the two factors from the leading rank-1 term
+                        A1 = reshape(Fsep.U[:,1], d1, d1) .* sqrt(sv[1])
+                        B1 = reshape(Fsep.V[:,1], d2, d2) .* sqrt(sv[1])
+                        _iddist(X,n) = (dg = [real(X[i,i]) for i in 1:n];
+                          offnrm = sqrt(max(sum(abs2,X) - sum(abs2,dg), 0.0));
+                          dgcv = (isempty(dg)||abs(sum(dg))<eps()) ? 1.0 : LinearAlgebra.norm(dg .- sum(dg)/n)/(abs(sum(dg))/sqrt(n));
+                          (round(offnrm/max(sqrt(sum(abs2,X)),eps());sigdigits=3), round(dgcv;sigdigits=3)))
+                        oa,va = _iddist(A1,d1); ob,vb = _iddist(B1,d2)
+                        println("   SEPARABILITY  top-SV²frac= ", round(sep_frac;sigdigits=4),
+                                " (1.0=separable A⊗B)  | factor1 dim", d1, " offdiag_frac=", oa, " diag_CV=", va,
+                                " | factor2 dim", d2, " offdiag_frac=", ob, " diag_CV=", vb,
+                                "   (offdiag_frac≈0 & diag_CV≈0 ⇒ that factor ≈ scalar·I)")
+                        # BLOCK-DIAGONALITY: is M[a1,a2,a1',a2'] block-diagonal in axis1
+                        # (a1=a1') or axis2 (a2=a2')? off-axisX frac ≈ 0 ⇒ M does NOT mix
+                        # that axis's values. Tests M = Σ_k |k⟩⟨k| ⊗ (m-block) form.
+                        _tot = sum(abs2, G4)
+                        _offk = 0.0
+                        for i in 1:d1, ip in 1:d1
+                          i == ip && continue
+                          _offk += sum(abs2, @view G4[i,:,ip,:])
+                        end
+                        _offm = 0.0
+                        for j in 1:d2, jp in 1:d2
+                          j == jp && continue
+                          _offm += sum(abs2, @view G4[:,j,:,jp])
+                        end
+                        println("   BLOCKDIAG  off-axis1(dim", d1, ") frac=",
+                                round(sqrt(_offk/max(_tot,eps()));sigdigits=3),
+                                "  off-axis2(dim", d2, ") frac=",
+                                round(sqrt(_offm/max(_tot,eps()));sigdigits=3),
+                                "   (≈0 ⇒ M block-diagonal in that axis)")
+                      end
+                      if d <= 16
+                        for i in 1:d
+                          println("   row ", i, ": ", [round(real(arr[i,j]); sigdigits=3) for j in 1:d])
+                        end
+                      else
+                        println("   (matrix ", d, "x", d, " too large to print; spectrum above shows rank structure)")
+                      end
+                      flush(stdout)
+                    end
+                    _gdump("Lgram b=$b", Lgram); _gdump("Rgram b=$b", Rgram)
+                  end
                   # Case 4 (aliased ψ × aliased PHP) signal — drives the aliased
                   # relayout of the M^{−1/2} factors (canonical pre-H apply, no
                   # forced fission). Case 2 (dense H) ⇒ false ⇒ factors stay dense
@@ -726,11 +710,7 @@ function dmrg(
                   # NOT on H's format. The `any(H[j] aliased)` term was a conservative
                   # "byte-identical for dense-H" gate, but it leaves the M^{−1/2} apply
                   # densifying the aliased operand (P=3/dedup→P=2/dense) for dense-H.
-                  # SB_ALIASED_MINV_WRAP_DENSEH=1 drops the H requirement so the wrap
-                  # also fires for dense-H (aliased φ) → operand stays channel-sparse.
-                  _minv_both_aliased = _is_aliased_itensor(phi) &&
-                    (get(ENV, "SB_ALIASED_MINV_WRAP_DENSEH", "0") == "1" ||
-                     any(j -> _is_aliased_itensor(PH.H[j]), site_range(PH)))
+                  _minv_both_aliased = _is_aliased_itensor(phi)
                   Mhalf_L, Linv_L, Mhalf_R, Linv_R =
                     SparseBackends.build_minv_half_pair_factored(Lgram, Rgram; phi_template=phi,
                                                                  both_aliased=_minv_both_aliased)
@@ -738,6 +718,11 @@ function dmrg(
 
                 # Recast H_eff output back to phi's aliased/BS classification
                 # (schema-preserving alignment), shared by both eigsolve paths.
+                # SB_RECAST_DEDUP_CHK=1: after each recast, compare the OUTPUT's dedup
+                # (nb/nt) + sparsity (nb, key-set) to φ's — to confirm the recast restores
+                # φ's compression/sparsity (if not, Krylov vectors stay de-deduped and the
+                # adds churn). Per-bond latch, capped at SB_RECAST_DEDUP_CHK_MAX (default 8).
+                _recast_chk = Ref(0)
                 recast_to_phi = function(Hv)
                   if ITensors.has_external_storage(Hv) && ITensors.has_external_storage(phi)
                     Tw = ITensors.get_external_storage(phi)
@@ -747,49 +732,82 @@ function dmrg(
                           SparseBackends.recast_bs_to_template(Cw, Tw))
                     elseif Cw isa SparseBackends.WrappedAliasedBlockSparse &&
                            Tw isa SparseBackends.WrappedAliasedBlockSparse
-                      return ITensors._itensor_from_external_storage(
-                          SparseBackends.recast_aliased_to_template(Cw, Tw))
+                      # SB_SNAP_PHI=1 (experiment): snap the matvec output to φ's exact
+                      # 36-key/dedup schema — DROPS the M^½-inflation keys (out∉φ) and
+                      # restores dedup, instead of the permute-only recast. Tests whether
+                      # those full-norm-but-factorize-discarded keys affect the eigenvalue.
+                      out = if get(ENV, "SB_SNAP_PHI", "0") == "1"
+                          # recast first (permute to φ axis order), THEN snap (filter to φ keys)
+                          _rc = SparseBackends.recast_aliased_to_template(Cw, Tw)
+                          ITensors._itensor_from_external_storage(
+                              _rc isa SparseBackends.WrappedAliasedBlockSparse ?
+                                  SparseBackends._snap_to_schema(_rc, Tw) : _rc)
+                      elseif get(ENV, "SB_DROP_KRYLOV", "0") == "1"
+                          # DISCRIMINATOR: drop the same out-of-φ keys as SNAP, but keep the
+                          # matvec output's OWN dedup (templates unchanged) → the downstream
+                          # add!! stays on the in-place path. If this is exact at md40 while
+                          # SNAP (dedup-restoring) drifted 1.7e-3, the drift was the merge-add
+                          # path, not an M^½-frame matrix-element loss → matvec pruning is safe.
+                          _rc = SparseBackends.recast_aliased_to_template(Cw, Tw)
+                          if _rc isa SparseBackends.WrappedAliasedBlockSparse
+                              _allowed = Set(Tw.aliased.keys)
+                              ITensors._itensor_from_external_storage(
+                                  SparseBackends.filter_keys_keepdedup(_rc, _allowed))
+                          else
+                              ITensors._itensor_from_external_storage(_rc)
+                          end
+                      else
+                          ITensors._itensor_from_external_storage(
+                              SparseBackends.recast_aliased_to_template(Cw, Tw))
+                      end
+                      if get(ENV, "SB_RECAST_DEDUP_CHK", "0") == "1" &&
+                         _recast_chk[] < parse(Int, get(ENV, "SB_RECAST_DEDUP_CHK_MAX", "8")) &&
+                         ITensors.has_external_storage(out)
+                        _recast_chk[] += 1
+                        Ow = ITensors.get_external_storage(out).aliased; Pw = Tw.aliased
+                        onb = length(Ow.keys); ont = Ow.n_templates
+                        pnb = length(Pw.keys); pnt = Pw.n_templates
+                        # WASTED-BLOCK CHECK: keys present in the temporary (matvec output, now
+                        # in phi's axis order) but ABSENT from phi → blocks we instantiated /
+                        # GEMM'd that are NOT in the final psi-space and get filtered out here.
+                        # (recast only permutes axes, so Ow.keys is the temporary's key-set.)
+                        _pset = Set(Pw.keys)
+                        wasted = [k for k in Ow.keys if !(k in _pset)]   # in temporary, not in phi
+                        _oset = Set(Ow.keys)
+                        n_zero = count(k -> !(k in _oset), Pw.keys)       # in phi, not produced
+                        # WASTED-BLOCK NORMS: is each discarded block ~zero (⇒ filtering exact)?
+                        let bs = Ow.blksize, T = eltype(Ow.templates)
+                            _bn(i) = (off=(Int(Ow.alias_ids[i])-1)*bs;
+                                      abs(Ow.scalars[i]) * sqrt(sum(abs2, @view Ow.templates[off+1:off+bs])))
+                            _allmax = maximum((_bn(i) for i in 1:onb); init=0.0)
+                            _widx = [i for i in 1:onb if !(Ow.keys[i] in _pset)]
+                            _wmax = isempty(_widx) ? 0.0 : maximum(_bn(i) for i in _widx)
+                            _wsum = isempty(_widx) ? 0.0 : sqrt(sum(_bn(i)^2 for i in _widx))
+                            _ksum = sqrt(sum((_bn(i)^2 for i in 1:onb if Ow.keys[i] in _pset); init=0.0))
+                            println("[WASTED_NORM #", _recast_chk[], " b=", b, "]  max_block=", round(_allmax,sigdigits=3),
+                                    "  WASTED max=", round(_wmax,sigdigits=3), " (rel ", round(_wmax/max(_allmax,eps()),sigdigits=3),
+                                    ")  ||wasted||/||kept||=", round(_wsum/max(_ksum,eps()),sigdigits=3))
+                        end
+                        println("[RECAST_CHK #", _recast_chk[], " b=", b, " sw=", sw, "]  out_nb=", onb,
+                                " nt=", ont, " dedup=", round(onb/max(ont,1), digits=2),
+                                "x | phi_nb=", pnb, " nt=", pnt, " dedup=", round(pnb/max(pnt,1), digits=2),
+                                "x | WASTED(out∉phi)=", length(wasted), " (",
+                                round(100*length(wasted)/max(onb,1), digits=1), "% of out)",
+                                "  zero_in_phi(phi∉out)=", n_zero,
+                                "  keyset_match=", isempty(wasted) && n_zero == 0)
+                        for k in wasted[1:min(end, 12)]
+                            println("    wasted key (instantiated, discarded on recast): ", k)
+                        end
+                        length(wasted) > 12 && println("    … (", length(wasted)-12, " more wasted keys)")
+                      end
+                      return out
                     end
                   end
                   return Hv
                 end
 
-                if get(ENV, "BMF_RAYLEIGH_RITZ", "0") == "1"
-                  # ⚠ ARCHIVED / PARKED (2026-06) — default OFF (BMF_RAYLEIGH_RITZ unset).
-                  # Validated correct (matches dense oracle b=1/b=3 ~1e-11; matches B_op
-                  # energy end-to-end at N=4) and stays aliased (plus_dense=0), but ~2.5×
-                  # slower than the default B_op path (extra H-matvecs + fissioned matvec
-                  # input). Parked for later perf work; do NOT enable in benchmarks. See
-                  # README "ARCHIVED: Rayleigh-Ritz". Resume by setting BMF_RAYLEIGH_RITZ=1.
-                  # ── Generalized Rayleigh-Ritz (no M^{±1/2} as a vector op) ────
-                  # Solves H_eff·φ = E·M·φ by projecting onto a small aliased
-                  # Krylov subspace built only from H·v (stays aliased via
-                  # recast_to_phi), forming k×k H_small/M_small with SCALAR inner
-                  # products (M applied with RAW Lgram/Rgram — no square root, no
-                  # BMF_MINV_RTOL), and solving the tiny null-projected generalized
-                  # eig. Ritz vector φ_new = Σ cᵢ vᵢ is an aliased combo of
-                  # φ-schema vectors → stays aliased. Mhalf_*/Linv_* are unused on
-                  # this path (build_minv_half_pair_factored above is wasted work
-                  # here; left running so this branch is a pure add — gate it for
-                  # perf once correctness is proven). BMF_RR_RTOL tunes the k×k
-                  # null cutoff (default 1e-8; far better conditioned than the
-                  # per-side gram, so the aggressive B_op 1e-1 is not needed).
-                  Hop_rr = v -> recast_to_phi(product(PH, v))
-                  rr_rtol = parse(Float64, get(ENV, "BMF_RR_RTOL", "1e-8"))
-                  vals, vecs = SparseBackends.rayleigh_ritz_local_eigsolve(
-                      Hop_rr, phi, Lgram, Rgram;
-                      which     = eigsolve_which_eigenvalue,
-                      tol       = eigsolve_tol,
-                      krylovdim = eigsolve_krylovdim,
-                      maxiter   = eigsolve_maxiter,
-                      rtol      = rr_rtol,
-                      b = b, ha = ha, sw = sw,
-                  )
-                  if get(ENV, "SB_BOND_EIG_DBG", "0") == "1"
-                      println("[BOND_EIG b=", b, " ha=", ha, " sw=", sw, "] RR smallest=", real(vals[1]))
-                      flush(stdout)
-                  end
-                elseif get(ENV, "BMF_BOP_PROJECT", "1") == "1"   # B_op null-projected eigensolve default ON (hardened 2026-06; no-op for canonical M=I)
+                if run_mode === :bop_aliased || run_mode === :bop_densify
+                  # B_op family: null-projected symmetric eigensolve (was BMF_BOP_PROJECT=1)
                   # ── Option A: null-space-projected symmetric eigensolve ────────
                   # B = M^{−1/2} · H_eff · M^{−1/2}, solved with the STANDARD inner
                   # product (plain Lanczos). Linv = M^{−1/2} has null(M) directions
@@ -804,16 +822,28 @@ function dmrg(
                   # All M^{±1/2} applies go through apply_minv_preserve_bs, which is
                   # schema-preserving, so (keys, alias_ids, scalars) — i.e. P's action
                   # — are untouched; only the template values transform.
-                  # NOTE: deferring opL's fission (SB_ALIASED_MINV_DEFER) does NOT work — opL
-                  # (Linv_L) and opR (Linv_R) fission DIFFERENT bonds (left vs right); both are
-                  # required for φ's schema, so skipping opL leaves a mixed classification that
-                  # breaks the factorize. Reducing M⁻¹ cost needs a standalone re-fission op.
+                  # SB_STEP_IDX_DBG=1: dump the M^{±1/2}-apply index order (the "Minv" steps of
+                  # the B = M^{-1/2}·H_eff·M^{-1/2} chain). Combine with SB_KRYLOV_IDX_DBG (Lenv/
+                  # H1/H2/Renv operators + B(y) IN/OUT) and TRACE_BOND (per-step intermediates)
+                  # for the full Minv→Lenv→H1→H2→Renv→Minv index trace. Per-bond latch.
+                  _step_idx_n = Ref(0)
                   apply_half = function(opL, opR, z; fission::Bool=true)
+                    _sidbg = get(ENV, "SB_STEP_IDX_DBG", "0") == "1" &&
+                             _step_idx_n[] < parse(Int, get(ENV, "SB_STEP_IDX_DBG_MAX", "12"))
+                    if _sidbg
+                      _step_idx_n[] += 1
+                      println("[STEP_IDX #", _step_idx_n[], " b=", b, " sw=", sw,
+                              "] Minv-apply IN  inds=", collect(ITensors.inds(z)))
+                    end
                     z = SparseBackends.apply_minv_preserve_bs(opL, z, phi; fission)
                     z = SparseBackends.apply_minv_preserve_bs(opR, z, phi; fission)
+                    if _sidbg
+                      println("[STEP_IDX #", _step_idx_n[], " b=", b, " sw=", sw,
+                              "] Minv-apply OUT inds=", collect(ITensors.inds(z)))
+                    end
                     return z
                   end
-                  # Deferred-fission on the PRE-H apply_half (HARDENED 2026-06): its output
+                  # Deferred-fission  onthe PRE-H apply_half (HARDENED 2026-06): its output
                   # is consumed only by product(PH,·), which re-establishes φ's schema
                   # internally (matvec hint-lastonly), so the M^{−1/2}y intermediate need
                   # not be fissioned to φ's classification. Both sides skip fission together
@@ -847,10 +877,32 @@ function dmrg(
                   _lpos, _rpos = PH.lpos, PH.rpos
                   _L0 = (1 <= _lpos <= length(PH.LR) && isassigned(PH.LR, _lpos)) ? PH.LR[_lpos] : nothing
                   _R0 = (1 <= _rpos <= length(PH.LR) && isassigned(PH.LR, _rpos)) ? PH.LR[_rpos] : nothing
-                  _env_dress = !_minv_both_aliased &&
-                               (_L0 === nothing || !ITensors.has_external_storage(_L0)) &&
-                               (_R0 === nothing || !ITensors.has_external_storage(_R0))
-                  if _env_dress
+                  # Env-dressing is a function of ENV STORAGE, not run_mode: it's valid
+                  # whenever the L/R envs are dense (⇔ H is dense, e.g. aliased ψ on bare
+                  # H). Both B_op modes use it when available; the densify run_mode decision
+                  # does NOT gate dressing. Aliased envs (both-aliased ψ×PHP) would need a
+                  # contract_preserve_bs fold (deferred) → no dressing, per-vector apply_half.
+                  _envs_dense = (_L0 === nothing || !ITensors.has_external_storage(_L0)) &&
+                                (_R0 === nothing || !ITensors.has_external_storage(_R0))
+                  if run_mode === :bop_densify && !_envs_dense
+                    error("run_mode=:bop_densify requires dense L/R environments; got aliased/external-storage envs — use run_mode=:bop_aliased")
+                  end
+                  if _envs_dense
+                    # ── ENV-DRESSING (dense-env case, INDEPENDENT of run_mode) ─────────
+                    # Fold M^{−1/2}=Linv into BOTH link legs of the dense L/R envs ONCE per
+                    # bond, so B = M^{−1/2} H M^{−1/2} becomes a SINGLE matvec with no
+                    # per-iteration apply_half. M=Lgram⊗Rgram is an outer product → Linv_L
+                    # hits only the left link (= Lenv's ket/bra legs), Linv_R only the right.
+                    # plev-2 temporaries avoid colliding with the env's own bra-link.
+                    # PH.LR is saved/restored (env cache assumed immutable by _makeL!/_makeR!).
+                    # NOTE: `env(dense) * Linv(aliased)` routes through
+                    # contract_aliased_dense_to_dense ⇒ a DENSE dressed env. The env was
+                    # already dense before dressing (matvec was denseH_*), so dressing does
+                    # NOT change the OPERAND's storage: dense env × aliased V still yields an
+                    # aliased V (denseH_wrapV), exactly as the old per-vector path. The
+                    # run_mode therefore still selects the operand form: :bop_aliased keeps V
+                    # aliased through the solve; :bop_densify densifies the seed so the local
+                    # Lanczos runs in dense BLAS (and re-aliases to φ's keys at recovery).
                     _dress_env = function(env, Linv)
                       Lk  = ITensors.replaceprime(Linv, 1 => 2)            # [l(0), l(2)]
                       env = ITensors.replaceprime(env * Lk, 2 => 0; tags = "Link")  # contract l(0); l(2)→l(0)
@@ -861,18 +913,82 @@ function dmrg(
                     try
                       (_L0 isa ITensor) && (PH.LR[_lpos] = _dress_env(_L0, Linv_L))
                       (_R0 isa ITensor) && (PH.LR[_rpos] = _dress_env(_R0, Linv_R))
-                      # DENSE LOCAL SOLVE: the operand is dedup=1 the instant M^{1/2} is
-                      # applied (measured: eigsolve operand→result dedup 2.0→1.0, keys
-                      # preserved), so the aliased wrapper buys nothing during the solve —
-                      # the Lanczos dots/adds just hit the wrapped×wrapped densify-fallback
-                      # (9 s / 17.6 GiB). Run the whole local solve in PLAIN DENSE ITensors
-                      # (dense BLAS dots), then re-impose φ's keys on the recovered
-                      # eigenvector via wrap_dense_as_aliased_via_template — this reproduces
-                      # the current dedup=1+keys eigsolve-RESULT exactly, so replacebond!'s
-                      # channel-aware SVD re-derives dedup losslessly as before.
-                      B_op = y -> recast_to_phi(product(PH, y))  # dense in → dense out (folded M^{−1/2}HM^{−1/2})
-                      y0 = SparseBackends.to_dense_itensors_unfused(
-                               apply_half(Mhalf_L, Mhalf_R, phi))  # y0 = M^{1/2} φ, densified
+                      # SB_KRYLOV_IDX_DBG: dump the ITensor index orders of the tensors in
+                      # the Krylov matvec (operator pieces once; operand y IN / B(y) OUT per
+                      # matvec) for selected bonds — to see exactly which leg order the kernel
+                      # receives vs emits (the leg order printed IS the kernel's label order).
+                      # SB_KRYLOV_IDX_BONDS (default "1,3,5") picks bonds (1 = left edge, last
+                      # = right edge for a 6-site N=2 chain); SB_KRYLOV_IDX_SWEEP picks the sweep.
+                      _kdbg_bonds = Set(parse.(Int, split(get(ENV,"SB_KRYLOV_IDX_BONDS","1,3,5"), ",")))
+                      _kdbg = get(ENV,"SB_KRYLOV_IDX_DBG","0")=="1" && (b in _kdbg_bonds) &&
+                              ha == 1 && sw == parse(Int, get(ENV,"SB_KRYLOV_IDX_SWEEP","2"))
+                      _kn = Ref(0)
+                      if _kdbg
+                        println("\n===== [KRYLOV-IDX  bond b=$b (sites $b,$(b+1))  ha=$ha sw=$sw  run_mode=$run_mode] =====")
+                        println("  OPERATOR pieces (dressed env folds in M^{-1/2}):")
+                        (_L0 isa ITensor) ? println("    Lenv(dressed) inds = ", ITensors.inds(PH.LR[_lpos])) :
+                                            println("    Lenv          = (none — LEFT EDGE)")
+                        println("    H[$b]         inds = ", ITensors.inds(PH.H[b]))
+                        println("    H[$(b+1)]         inds = ", ITensors.inds(PH.H[b+1]))
+                        (_R0 isa ITensor) ? println("    Renv(dressed) inds = ", ITensors.inds(PH.LR[_rpos])) :
+                                            println("    Renv          = (none — RIGHT EDGE)")
+                        println("    phi(template) inds = ", ITensors.inds(phi))
+                      end
+                      B_op = function(y)
+                        out = recast_to_phi(product(PH, y))  # folded M^{−1/2}HM^{−1/2}
+                        if _kdbg && _kn[] < 4
+                          _kn[] += 1
+                          println("\n  [matvec #$(_kn[])]  (index print order == kernel label order)")
+                          println("    y    IN  inds = ", ITensors.inds(y))
+                          println("    B(y) OUT inds = ", ITensors.inds(out))
+                          println("    IN order == OUT order? ", collect(ITensors.inds(y)) == collect(ITensors.inds(out)))
+                          SparseBackends.schema_dbg("eigstep B(y)#$(_kn[]) b=$b", out)
+                        end
+                        return out
+                      end
+                      _densify_solve = run_mode === :bop_densify
+                      # SB_KRYLOV_IDX_DBG: trace sparse-vs-dense classification + fill +
+                      # dedup along the Path-B pipeline at this bond — φ → M^{1/2}·φ (y0) →
+                      # the eigsolve Krylov steps (in B_op above) → recovered φ. (schema_dbg
+                      # self-gates on SB_SCHEMA_DBG, so enable both.)
+                      if _kdbg; SparseBackends.schema_dbg("phi (input)      b=$b", phi); end
+                      # y0 = M^{1/2} φ; aliased for :bop_aliased (V stays wrapped through the
+                      # solve), densified for :bop_densify (dense BLAS local solve).
+                      y0 = apply_half(Mhalf_L, Mhalf_R, phi)
+                      _keytrace("2.y0 = M^{1/2}*phi (seed, raw)", y0)
+                      if get(ENV, "SB_SNAP_PHI", "0") == "1" &&
+                         ITensors.has_external_storage(y0) && ITensors.has_external_storage(phi)
+                        _y0w = ITensors.get_external_storage(y0); _pw = ITensors.get_external_storage(phi)
+                        if _y0w isa SparseBackends.WrappedAliasedBlockSparse &&
+                           _pw isa SparseBackends.WrappedAliasedBlockSparse
+                          y0 = ITensors._itensor_from_external_storage(SparseBackends._snap_to_schema(_y0w, _pw))
+                        end
+                      end
+                      # SB_DROP_KRYLOV: filter the SEED to φ's key set too (dedup-1 kept),
+                      # so v₀ and every matvec output w share the SAME 36-key set → the
+                      # orthogonalization w−α·v₀ can't reintroduce dropped keys. Without
+                      # this the seed stays 72-key and −α·v₀ merges the dropped keys back.
+                      if get(ENV, "SB_DROP_KRYLOV", "0") == "1" &&
+                         ITensors.has_external_storage(y0) && ITensors.has_external_storage(phi)
+                        _y0w = ITensors.get_external_storage(y0); _pw = ITensors.get_external_storage(phi)
+                        if _y0w isa SparseBackends.WrappedAliasedBlockSparse &&
+                           _pw isa SparseBackends.WrappedAliasedBlockSparse
+                          if get(ENV, "SB_DROP_KRYLOV_DBG", "0") == "1"
+                            _seedset = Set(_pw.aliased.keys)
+                            _seed_out = count(k -> !(k in _seedset), _y0w.aliased.keys)
+                            println("[SEED_DBG b=", b, " ha=", ha, " sw=", sw,
+                                    "] y0=M^{1/2}phi nb=", length(_y0w.aliased.keys),
+                                    " nt=", _y0w.aliased.n_templates,
+                                    " | phi nb=", length(_pw.aliased.keys),
+                                    " nt=", _pw.aliased.n_templates,
+                                    " | y0 keys NOT in phi=", _seed_out); flush(stdout)
+                          end
+                          y0 = ITensors._itensor_from_external_storage(
+                                   SparseBackends.filter_keys_keepdedup(_y0w, Set(_pw.aliased.keys)))
+                        end
+                      end
+                      if _kdbg; SparseBackends.schema_dbg("y0 = M^{1/2}*phi b=$b", y0); end
+                      _densify_solve && (y0 = SparseBackends.to_dense_itensors_unfused(y0))
                       vals, yvecs = eigsolve(
                           B_op, y0, 1, eigsolve_which_eigenvalue;
                           ishermitian = true,
@@ -881,15 +997,27 @@ function dmrg(
                           maxiter     = eigsolve_maxiter,
                           verbosity   = eigsolve_verbosity,
                       )
-                      # φ = M^{−1/2} y (dense), then re-alias to φ's keys (dedup=1) so the
-                      # channel-aware factorize at replacebond! rebuilds dedup.
-                      vecs = [SparseBackends.wrap_dense_as_aliased_via_template(
-                                  apply_half(Linv_L, Linv_R, y), phi) for y in yvecs]
+                      _keytrace("3.y = eigsolve result (Krylov eigenvector)", yvecs[1])
+                      # φ = M^{−1/2} y. :bop_aliased keeps it aliased; :bop_densify re-imposes
+                      # φ's keys (operand was dense) so replacebond!'s factorize rebuilds dedup.
+                      vecs = [begin
+                                _phi = apply_half(Linv_L, Linv_R, y)
+                                _densify_solve ?
+                                    SparseBackends.wrap_dense_as_aliased_via_template(
+                                        ITensors.has_external_storage(_phi) ?
+                                            SparseBackends.to_dense_itensors_unfused(_phi) : _phi,
+                                        phi) :
+                                    _phi
+                              end for y in yvecs]
+                      _keytrace("4.recovered phi = M^{-1/2}*y", vecs[1])
+                      if _kdbg; SparseBackends.schema_dbg("recovered phi = M^{-1/2}*y b=$b", vecs[1]); end
                     finally
                       (_L0 isa ITensor) && (PH.LR[_lpos] = _L0)
                       (_R0 isa ITensor) && (PH.LR[_rpos] = _R0)
                     end
                   else
+                  # No dressing (aliased L/R envs): per-vector apply_half keeps the operand
+                  # aliased through the solve. (run_mode=:bop_densify already errored above.)
                   B_op = function(y)
                     x  = apply_half(Linv_L, Linv_R, y; fission = false)  # M^{−1/2} y (big-block)
                     Hx = recast_to_phi(product(PH, x))         # H_eff M^{−1/2} y
@@ -913,12 +1041,49 @@ function dmrg(
                   )
                   vecs = [apply_half(Linv_L, Linv_R, y) for y in yvecs]   # φ = M^{−1/2} y
                   end
-                  if get(ENV, "SB_BOND_EIG_DBG", "0") == "1"
-                      println("[BOND_EIG b=", b, " ha=", ha, " sw=", sw, "] B_op smallest=", real(vals[1]),
-                              "  Mrank-ok? Linv built; <phi|phi>=", round(real(inner(phi, phi)); digits=6))
-                      flush(stdout)
+                  # ── PREFILTER-A (drop-at-factorize) ────────────────────────────
+                  # DROP-AT-FACTORIZE (default, hardened): snap the FINAL recovered φ back
+                  # to φ's key/dedup schema ONCE here (after eigsolve, before replacebond!),
+                  # leaving every Krylov vector untouched. M^{-1/2} de-duplicates the recovered
+                  # φ (dedup-4 → dedup-1) and at even bonds populates QN-forbidden channel
+                  # combos (36→72 keys); replacebond!'s factorize would project those out
+                  # anyway, so re-imposing φ's schema here is EXACT — validated BIT-IDENTICAL
+                  # across all 10 sweeps at N=12 md=40 (and N=2 md=10) — while restoring ψ's
+                  # dedup-4 compression on the stored tensor and shrinking the factorize input.
+                  # NOT an env-gated experiment: this is the schema-preserving contract of the
+                  # aliased Path-B (the stored ψ must live in φ's schema). It is a no-op on
+                  # non-aliased φ (structural guard below). Distinct from SB_SNAP_PHI, which
+                  # filtered EVERY Krylov vector and drifted 1.7e-3 (the keys carry real weight
+                  # DURING the iteration; only the final stored vector is free to snap).
+                  # SB_DROP_AT_FACT_DBG=1 prints per-bond key counts.
+                  if !isempty(vecs) &&
+                     ITensors.has_external_storage(vecs[1]) && ITensors.has_external_storage(phi)
+                    _vw0 = ITensors.get_external_storage(vecs[1])
+                    _pw0 = ITensors.get_external_storage(phi)
+                    if _vw0 isa SparseBackends.WrappedAliasedBlockSparse &&
+                       _pw0 isa SparseBackends.WrappedAliasedBlockSparse
+                      _rc0 = SparseBackends.recast_aliased_to_template(_vw0, _pw0)
+                      if _rc0 isa SparseBackends.WrappedAliasedBlockSparse
+                        if get(ENV, "SB_DROP_AT_FACT_DBG", "0") == "1"
+                          println("[DROP_AT_FACT b=", b, " ha=", ha, " sw=", sw,
+                                  "] phi_recovered nb=", length(_rc0.aliased.keys),
+                                  " nt=", _rc0.aliased.n_templates,
+                                  " | template nb=", length(_pw0.aliased.keys),
+                                  " nt=", _pw0.aliased.n_templates,
+                                  " | dropping=", length(_rc0.aliased.keys) - length(_pw0.aliased.keys))
+                          flush(stdout)
+                        end
+                        vecs[1] = ITensors._itensor_from_external_storage(
+                                      SparseBackends._snap_to_schema(_rc0, _pw0))
+                      end
+                    end
                   end
-                else
+                  if debug
+                    println("[BOND_EIG b=", b, " ha=", ha, " sw=", sw, "] B_op smallest=", real(vals[1]),
+                            "  Mrank-ok? Linv built; <phi|phi>=", round(real(inner(phi, phi)); digits=6))
+                    flush(stdout)
+                  end
+                else  # run_mode === :minner
                 # Path B (M-inner-product Lanczos): redefine the Krylov inner
                 # product to <x,y>_M = <x, M·y>.
                 M_dot = (x, y) -> begin
@@ -941,11 +1106,13 @@ function dmrg(
                 end
                 # A = M⁻¹·H_eff is the M-self-adjoint operator whose M-inner-product
                 # Lanczos returns the generalized eigenvalues. Fragile when M is
-                # near-singular (use BMF_BOP_PROJECT=1 for the robust variant above).
-                apply_minv_correction = get(ENV, "BMF_APPLY_MINV", "1") != "0"
+                # near-singular (use run_mode=:bop_aliased for the robust variant above).
+                # :minner is the collapsed A_op mode: M⁻¹ correction always applied,
+                # Hermitian Lanczos (the old BMF_APPLY_MINV=0 / BMF_ARNOLDI=1 corners
+                # are dropped — no test used them).
                 H_op = function(v)
                   Hv = recast_to_phi(product(PH, v[]))
-                  Av = apply_minv_correction ? apply_Minv(Hv) : Hv
+                  Av = apply_Minv(Hv)
                   return InnerProductVec(Av, M_dot)
                 end
                 vals, vecs = eigsolve(
@@ -953,7 +1120,7 @@ function dmrg(
                     phi_wrapped,
                     1,
                     eigsolve_which_eigenvalue;
-                    ishermitian = get(ENV, "BMF_ARNOLDI", "0") != "1",
+                    ishermitian = true,
                     tol         = eigsolve_tol,
                     krylovdim   = eigsolve_krylovdim,
                     maxiter     = eigsolve_maxiter,
@@ -961,6 +1128,37 @@ function dmrg(
                 )
                 vecs = [v[] for v in vecs]
                 end
+              # elseif get(ENV, "BMF_RAYLEIGH_RITZ", "0") == "1"
+                #   # ⚠ ARCHIVED / PARKED (2026-06) — default OFF (BMF_RAYLEIGH_RITZ unset).
+                #   # Validated correct (matches dense oracle b=1/b=3 ~1e-11; matches B_op
+                #   # energy end-to-end at N=4) and stays aliased (plus_dense=0), but ~2.5×
+                #   # slower than the default B_op path (extra H-matvecs + fissioned matvec
+                #   # input). Parked for later perf work; do NOT enable in benchmarks. See
+                #   # README "ARCHIVED: Rayleigh-Ritz". Resume by setting BMF_RAYLEIGH_RITZ=1.
+                #   # ── Generalized Rayleigh-Ritz (no M^{±1/2} as a vector op) ────
+                #   # Solves H_eff·φ = E·M·φ by projecting onto a small aliased
+                #   # Krylov subspace built only from H·v (stays aliased via
+                #   # recast_to_phi), forming k×k H_small/M_small with SCALAR inner
+                #   # products (M applied with RAW Lgram/Rgram — no square root, no
+                #   # BMF_MINV_RTOL), and solving the tiny null-projected generalized
+                #   # eig. Ritz vector φ_new = Σ cᵢ vᵢ is an aliased combo of
+                #   # φ-schema vectors → stays aliased. Mhalf_*/Linv_* are unused on
+                #   # this path (build_minv_half_pair_factored above is wasted work
+                #   # here; left running so this branch is a pure add — gate it for
+                #   # perf once correctness is proven). 
+                #   vals, vecs = SparseBackends.rayleigh_ritz_local_eigsolve(
+                #       Hop_rr, phi, Lgram, Rgram;
+                #       which     = eigsolve_which_eigenvalue,
+                #       tol       = eigsolve_tol,
+                #       krylovdim = eigsolve_krylovdim,
+                #       maxiter   = eigsolve_maxiter,
+                #       rtol      = 1e-8, # Hard coded to the defualt to remove old flag
+                #       b = b, ha = ha, sw = sw,
+                #   )
+                #   if debug
+                #       println("[BOND_EIG b=", b, " ha=", ha, " sw=", sw, "] RR smallest=", real(vals[1]))
+                #       flush(stdout)
+                #   end
               else
                 vals, vecs = eigsolve(
                   PH,
@@ -992,22 +1190,11 @@ function dmrg(
             vecs[1]
           end
           SparseBackends.schema_dbg("eigsolve-RESULT phi b=$b", phi)
+          _keytrace("5.phi before factorize (= vecs[1], post any drop)", phi)
           if get(ENV, "SB_ALIASED_TRACE", "0") == "1" && _EIGSOLVE_PHI_TRACE_COUNT[] < 5
             _EIGSOLVE_PHI_TRACE_COUNT[] += 1
             phi_st = ITensors.has_external_storage(phi) ? typeof(phi.tensor.data) : "dense"
             println("[SB_ALIASED_TRACE eigsolve returned #$(_EIGSOLVE_PHI_TRACE_COUNT[])]  phi storage=$phi_st  b=$b")
-          end
-
-          if debug_tracking()
-            key = (sw - 1) * 1000 + ha * 100 + b
-            if only_store
-              phi_tracker2[key] = phi
-            else
-              compare_data(phi, phi_tracker2[key], b, sw, "phi_post")
-              phi_aligned2 = align_links(phi, phi_tracker2[key], "phi_tracker2")
-              @assert !isnothing(phi_aligned2) "align_links failed for phi_tracker2 at b=$b sw=$sw ha=$ha: inds(phi)=$(inds(phi)) inds(stored)=$(inds(phi_tracker2[key]))"
-              # phi = phi_aligned2
-            end
           end
 
           ortho = ha == 1 ? "left" : "right"
@@ -1031,6 +1218,16 @@ function dmrg(
             replace_debug = true
           end
 
+          # ── FACT_KEY (before/after factorize key diff, SB_FACT_KEY_DBG=1) ──────
+          # Capture φ's key set going INTO replacebond!, then reconstitute the
+          # post-SVD two-site tensor and diff: keys in φ but gone after = what the
+          # factorize truncation actually discards (the provably-safe-to-drop set).
+          _factkey = get(ENV, "SB_FACT_KEY_DBG", "0") == "1"
+          _fk_in = nothing
+          if _factkey && ITensors.has_external_storage(phi) &&
+             ITensors.get_external_storage(phi) isa SparseBackends.WrappedAliasedBlockSparse
+            _fk_in = Set(ITensors.get_external_storage(phi).aliased.keys)
+          end
           t = @elapsed begin
             @timeit PROJMPO_TIMER "dmrg.replacebond!" begin
               spec = replacebond!(
@@ -1047,6 +1244,26 @@ function dmrg(
                 which_decomp,
                 svd_alg
               )
+            end
+          end
+          if _factkey && _fk_in !== nothing
+            try
+              _phiw = ITensors.get_external_storage(phi)
+              _aw = ITensors.get_external_storage(psi[b]); _bw = ITensors.get_external_storage(psi[b+1])
+              _rw = SparseBackends.wrapped_contract_aliased(_aw, _bw; preserve_bs_output=true)
+              _rw = _rw isa ITensors.ITensor ? ITensors.get_external_storage(_rw) : _rw
+              if _rw isa SparseBackends.WrappedAliasedBlockSparse
+                _rw = SparseBackends.recast_aliased_to_template(_rw, _phiw)   # align axes to φ
+                _rw = _rw isa ITensors.ITensor ? ITensors.get_external_storage(_rw) : _rw
+              end
+              _outkeys = (_rw isa SparseBackends.WrappedAliasedBlockSparse) ? Set(_rw.aliased.keys) : Set(eltype(_fk_in)[])
+              _dropped = setdiff(_fk_in, _outkeys); _added = setdiff(_outkeys, _fk_in)
+              println("[FACT_KEY b=", b, " ha=", ha, " sw=", sw, "] phi_in=", length(_fk_in),
+                      " recon_out=", length(_outkeys), " dropped(in∖out)=", length(_dropped),
+                      " added(out∖in)=", length(_added))
+              flush(stdout)
+            catch e
+              println("[FACT_KEY b=", b, "] recon failed: ", sprint(showerror, e)); flush(stdout)
             end
           end
           SparseBackends.schema_dbg("replacebond-OUT psi[$b]", psi[b])
@@ -1103,9 +1320,6 @@ function dmrg(
           )
 
           only_idx += 1
-          if debug_tracking()
-            check_equality!(tensor_tracker, PH, psi; only_store=only_store, only_idx=only_idx)
-          end
         end
       end
       println(" Check time breakdown ", "Time spent in position! ", pos_time, " seconds. Time spent in optimization step (eigsolve + replacebond!) ", opt_time, " seconds.")
