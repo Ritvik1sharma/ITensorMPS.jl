@@ -406,6 +406,10 @@ function dmrg(
   #   :bop_densify — same B_op but env-dressed + DENSIFIED seed (needs dense L/R envs)
   #   :minner      — A = M^{-1} H_eff, M-inner-product Lanczos
   run_mode::Symbol=:bop_aliased,
+  # Step 2b (from-P M^{±1/2}): when true, build M^{±1/2}=c^{∓...}·G from the geometric
+  # constant c=2^⌈env/2⌉ (no eigen), instead of eigendecomposing the gram. Default nothing
+  # → eigen path unchanged. Optional arg, no env var.
+  minv_from_p::Union{Nothing,Bool}=nothing,
   debug=false
 )
   run_mode in (:iso, :bop_aliased, :bop_densify, :minner) ||
@@ -626,10 +630,8 @@ function dmrg(
                   Rgram = SparseBackends.get_right_gram(gram_cache, b)
                   SparseBackends.schema_dbg("GRAM Lgram b=$b", Lgram)
                   SparseBackends.schema_dbg("GRAM Rgram b=$b", Rgram)
-                  # SB_GRAM_DUMP=1: print Lgram/Rgram as dense matrices to SEE the channel
-                  # coupling (off-diagonal = M mixes channels = source of forbidden combos).
-                  if get(ENV, "SB_GRAM_DUMP", "0") == "1" &&
-                     (b in Set(parse.(Int, split(get(ENV,"SB_GRAM_DUMP_BOND","2"),",")))) && ha == 1
+                  # Gram-structure diagnostic (eigenvalues, rank, separability, block-diagonality; proved M=c·Π). Manually enable: change `if false` → `if true`.
+                  if false
                     _gdump = function(lbl, G)
                       gi = collect(ITensors.inds(G))
                       if isempty(gi); println("[GRAM_DUMP ", lbl, "] scalar/empty"); flush(stdout); return; end
@@ -711,9 +713,18 @@ function dmrg(
                   # "byte-identical for dense-H" gate, but it leaves the M^{−1/2} apply
                   # densifying the aliased operand (P=3/dedup→P=2/dense) for dense-H.
                   _minv_both_aliased = _is_aliased_itensor(phi)
+                  # Step 2b: geometric c = 2^⌈env/2⌉ per side (env = #sites contracted into
+                  # that gram). Lgram at bond b = gram of sites 1..b-1; Rgram = sites b+2..N.
+                  _p_c = if minv_from_p === true
+                    _N = length(psi)
+                    (2.0^cld(b - 1, 2), 2.0^cld(_N - b - 1, 2))
+                  else
+                    nothing
+                  end
                   Mhalf_L, Linv_L, Mhalf_R, Linv_R =
                     SparseBackends.build_minv_half_pair_factored(Lgram, Rgram; phi_template=phi,
-                                                                 both_aliased=_minv_both_aliased)
+                                                                 both_aliased=_minv_both_aliased,
+                                                                 p_c=_p_c)
                 end
 
                 # Recast H_eff output back to phi's aliased/BS classification
