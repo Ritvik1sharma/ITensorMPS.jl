@@ -852,6 +852,7 @@ function ITensors.contract(
         ψ::MPS,
         Abackend,
         Bbackend;
+        Cbackend=nothing,
         denseLinksA::Union{Nothing,Int}=nothing,
         denseLinksB::Union{Nothing,Int}=nothing,
     )::MPS
@@ -873,8 +874,8 @@ function ITensors.contract(
         aRight = (i == n) ? ITensors.Index[] : _mpo_bond_links(A, i,   i+1)
         bLeft  = (i == 1) ? ITensors.Index[] : _mps_bond_links(ψ, i-1, i)
         bRight = (i == n) ? ITensors.Index[] : _mps_bond_links(ψ, i,   i+1)
-        Ci, bondmap = SparseBackends.contract_and_fuse_links(
-        A[i], ψ[i], Abackend, Bbackend, bondmap;
+        Ci, bondmap = SparseBackends.top_level_contract(
+        A[i], ψ[i], Abackend, Bbackend, Cbackend, bondmap;
         denseLinksA=denseLinksA,
         denseLinksB=denseLinksB,
         aLeft=aLeft, aRight=aRight,
@@ -1076,6 +1077,7 @@ end
 
 function ITensors.contract(A::MPO, B::MPO,
                            Abackend::Symbol, Bbackend::Symbol;
+                           Cbackend=nothing,
                            denseLinksA::Union{Nothing,Int}=nothing,
                            denseLinksB::Union{Nothing,Int}=nothing,
                            kwargs...)
@@ -1096,8 +1098,8 @@ function ITensors.contract(A::MPO, B::MPO,
     aRight = (i == N) ? ITensors.Index[] : _mpo_bond_links(A, i,   i+1)
     bLeft  = (i == 1) ? ITensors.Index[] : _mpo_bond_links(B, i-1, i)
     bRight = (i == N) ? ITensors.Index[] : _mpo_bond_links(B, i,   i+1)
-    Ci, bondmap = SparseBackends.contract_and_fuse_links(
-      A[i], B[i], Abackend, Bbackend, bondmap;
+    Ci, bondmap = SparseBackends.top_level_contract(
+      A[i], B[i], Abackend, Bbackend, Cbackend, bondmap;
       denseLinksA=denseLinksA,
       denseLinksB=denseLinksB,
       aLeft=aLeft, aRight=aRight,

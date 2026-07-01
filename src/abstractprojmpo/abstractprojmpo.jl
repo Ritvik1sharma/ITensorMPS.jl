@@ -248,78 +248,18 @@ function print_env_footprint(; labelA="ALI", labelB="DEN")
     return nothing
 end
 
-# Counter for SB_HINT_DBG (prints the first N computed hints).
-const _HINT_DBG_COUNT = Ref{Int}(0)
-
-# Compute a preferred-output-label ordering for the result of
-# `it * Hv`, given the NEXT operator `it_next` it will be contracted with.
-#
-# Rule (schema-driven, deterministic):
-#   - if the output label is in `it_next`'s sparse PREFIX → shared_prefix (LAST)
-#   - if the output label is in `it_next`'s dense TAIL    → red_dense (FIRST)
-#   - else (passes through next contraction) → keepB (MIDDLE)
-# This makes the next call's `permute_B` = identity by construction.
-#
-# Returns `nothing` if `it_next` isn't an aliased sparse tensor (no hint useful).
-function _layout_hint_for_next(it_next, current_it, current_Hv)::Union{Nothing, Vector{ITensors.Index}}
-    if it_next isa OneITensor
-        return nothing
-    end
-    if !ITensors.has_external_storage(it_next)
-        return nothing
-    end
-    storage = ITensors.get_external_storage(it_next)
-    if !(storage isa SparseBackends.WrappedAliasedBlockSparse)
-        return nothing
-    end
-    PA = SparseBackends._abs_head_len(storage)
-    next_inds_v = collect(inds(it_next))
-    # Compute expected output labels of THIS step: it ⊕ Hv − shared.
-    shared = ITensors.commoninds(current_it, current_Hv)
-    out_inds = ITensors.Index[]
-    for I in inds(current_it)
-        if !(I in shared)
-            push!(out_inds, I)
-        end
-    end
-    for I in inds(current_Hv)
-        if !(I in shared)
-            push!(out_inds, I)
-        end
-    end
-    # Iterate next.A's axes (not our out_inds) so that shared_prefix lands in
-    # next.A.prefix order and red_dense in next.A.tail order — which is exactly
-    # the order the next kernel's permB construction will look them up by.
-    out_set = Set(out_inds)
-    red_dense     = ITensors.Index[]
-    shared_prefix = ITensors.Index[]
-    for i in (PA + 1):length(next_inds_v)
-        I = next_inds_v[i]
-        if I in out_set
-            push!(red_dense, I)
-        end
-    end
-    for i in 1:PA
-        I = next_inds_v[i]
-        if I in out_set
-            push!(shared_prefix, I)
-        end
-    end
-    placed = Set{ITensors.Index}()
-    union!(placed, red_dense)
-    union!(placed, shared_prefix)
-    # keepB keeps its incoming traversal order (kernel iterates labelsB which
-    # IS our output, so whatever order we choose is honored).
-    keepB = ITensors.Index[I for I in out_inds if !(I in placed)]
-    return vcat(red_dense, keepB, shared_prefix)
-end
+# The preferred-output ordering for the `it * Hv` result (so the NEXT
+# contraction's `permB` is identity) is now derived kernel-side from the next
+# operator itself — see `_canon_labels_for_next` in SparseBackends. The matvec
+# loop passes the next chain operator as `next_op=` rather than recomputing the
+# step's shared/output indices here.
 
 # Dense-chain layout hint: order THIS step's output so the NEXT step's kernel
 # `permA` (input-ψ reorg) is identity — the axes reduced at the next step (shared
 # with it_next) go LAST, into the kernel's `red_dense` slot, so it needn't permute
 # the input. Operates purely on index structure (the chain is deterministic), and
-# unlike `_layout_hint_for_next` it handles a DENSE `it_next` (our denseH_wrapV
-# matvec chain). Returns an ordered Vector{Index} or nothing.
+# unlike the kernel-side next_op ordering it handles a DENSE `it_next` (our
+# denseH_wrapV matvec chain). Returns an ordered Vector{Index} or nothing.
 function _dense_chain_hint(current_Hv, current_it, it_next)
     it_next isa OneITensor && return nothing
     shared = ITensors.commoninds(current_it, current_Hv)
@@ -565,6 +505,7 @@ function ITensors.contract(P::AbstractProjMPO, v::ITensor)::ITensor
       println("\n========== [TRACE_BOND=$trace_bond_target] product(P, v) ==========")
       println("v storage = $_v_storage")
       println("v.inds = ", _show_inds(v))
+      SparseBackends.check_image("v (input = M^{1/2}φ)", v)
     end
 
     # SB_ALIASED_HINT_LASTONLY: defer the s'-fission. Pass φ's dense_inds hint only
@@ -573,7 +514,34 @@ function ITensors.contract(P::AbstractProjMPO, v::ITensor)::ITensor
     # fissioned into the sparse prefix at every step (tiny blocks). The final output
     # still matches φ's {N2,P} schema for the downstream M⁻¹/factorize.
     _hint_lastonly = true   # HARDENED (2026-06): defer s'-fission to the last matvec step → big-block intermediates (6.07→3.44 s/sweep, energy ~1e-12, aliasing preserved). No env toggle.
-    _last_real_idx = findlast(x -> !(x isa OneITensor), itensor_map)
+    _last_real_idx  = findlast(x -> !(x isa OneITensor), itensor_map)
+    # WRAP-AROUND: the matvec is cyclic across Krylov iterations — this output
+    # becomes the next iteration's input φ, which is contracted FIRST with the
+    # chain's first operator. So canonicalising the LAST step's output for that
+    # first operator makes the NEXT matvec's step-1 permA the identity (paired
+    # with the φ-template reorder in dmrg.jl `position!`).
+    _first_real_idx = findfirst(x -> !(x isa OneITensor), itensor_map)
+    _first_real_op  = _first_real_idx === nothing ? nothing : itensor_map[_first_real_idx]
+    # Bond-type for the static-perm table lookup (and the capture generator): the
+    # only chain variation is the edge reversal — left edge (lproj scalar) vs right
+    # edge (rproj scalar) vs bulk. Set in ENV for the wrapper to read.
+    _bondtype = (lproj(P) isa OneITensor) ? :left :
+                (rproj(P) isa OneITensor) ? :right : :bulk
+    ENV["SB_BONDTYPE"] = string(_bondtype)
+    # GENERATOR (SB_PERM_CAPTURE): the remaining real operators after step i, used by
+    # `_canon_by_rank` to derive the reduction-last order and print the per-(bond-type,
+    # step) permutation to bake into STATIC_OUTPUT_PERM. The LAST step wraps around to
+    # the first operator (its output becomes the next matvec's input φ). Off in
+    # production (table-only path); `nothing` ⇒ no operands piped to the live kernel.
+    _capture = get(ENV, "SB_PERM_CAPTURE", "0") == "1"
+    _remaining_ops(i) = i == _last_real_idx ? Any[_first_real_op] :
+        Any[itensor_map[j] for j in (i+1):_last_real_idx if !(itensor_map[j] isa OneITensor)]
+    # Bracket the matvec chain: the static output-perm table is keyed by the
+    # (SB_BONDTYPE, SB_STEP) coordinate set in this loop, and that coordinate is
+    # only meaningful here. _static_output_pref consults the table iff SB_IN_MATVEC
+    # is "1", so non-matvec aliased contractions (orthogonalize!, env builds) never
+    # apply a stale perm. Must be reset to "0" on every exit path from the loop.
+    ENV["SB_IN_MATVEC"] = "1"
     @timeit PROJMPO_TIMER "ProjMPO.contract" begin
       for it in itensor_map
           idx += 1
@@ -684,43 +652,14 @@ function ITensors.contract(P::AbstractProjMPO, v::ITensor)::ITensor
                           println("inds(Hv) = ", inds(Hv))
                       end
                       @timeit PROJMPO_TIMER "matvec.sparseH_denseV_$(idx)" begin
-                          # Plan B: put `it` on the left so output starts with
-                          # uncontr(it). Default behavior (off) keeps `Hv * it`.
-                          #
-                          # SB_AUTO_DISPATCH=1: bypass ITensor `*` and call the
-                          # SparseBackends path directly with a layout hint
-                          # derived from the NEXT operator in the chain. The
-                          # hint makes the next call's permute_B = identity by
-                          # construction and skips the ITensor contract-dispatch
-                          # overhead in this step.
-                          if get(ENV, "SB_AUTO_DISPATCH", "0") == "1"
-                              _it_next = (idx < length(itensor_map)) ? itensor_map[idx + 1] : OneITensor()
-                              _hint = _layout_hint_for_next(_it_next, it, Hv)
-                              if get(ENV, "SB_HINT_DBG", "0") == "1" &&
-                                 _HINT_DBG_COUNT[] < parse(Int, get(ENV, "SB_HINT_DBG_MAX", "12"))
-                                  _HINT_DBG_COUNT[] += 1
-                                  println("\n[SB_HINT_DBG #", _HINT_DBG_COUNT[],
-                                          "] idx=", idx, " of ", length(itensor_map))
-                                  println("  it inds = ", inds(it))
-                                  println("  Hv inds = ", inds(Hv))
-                                  println("  it_next type = ",
-                                      _it_next isa OneITensor ? "OneITensor" :
-                                      (ITensors.has_external_storage(_it_next) ?
-                                          string(typeof(ITensors.get_external_storage(_it_next))) :
-                                          "dense"))
-                                  if !(_it_next isa OneITensor)
-                                      println("  it_next inds = ", inds(_it_next))
-                                  end
-                                  println("  hint = ", _hint === nothing ? "nothing" : _hint)
-                              end
-                              Hv = SparseBackends.contract_aliased_itensor(
-                                  it, Hv, :aliased, :dense;
-                                  preserve_bs_output = false,
-                                  preferred_output_labels = _hint,
-                              )
-                          else
-                              Hv = get(ENV, "SB_PLAN_B", "0") == "1" ? it * Hv : Hv * it
-                          end
+                        # Plan B: put `it` on the left so output starts with
+                        # uncontr(it). Default behavior (off) keeps `Hv * it`.
+                        _it_next = (idx < length(itensor_map)) ? itensor_map[idx + 1] : nothing
+                        Hv = SparseBackends.contract_aliased_itensor(
+                            it, Hv, :aliased, :dense;
+                            preserve_bs_output = false,
+                            next_op = _it_next,
+                        )
                       end
                       if debug
                           println("After multiplying sparse H and dense V at position ", position, " and index ", idx)
@@ -740,16 +679,25 @@ function ITensors.contract(P::AbstractProjMPO, v::ITensor)::ITensor
                           # multiplicity axes (different ids than v) → over-fission. Use
                           # the current operands' union hint (here = dense_inds(Hv)).
                           # See _use_aa_hint above; untouched for dense-H / BS runs.
-                          # SB_ALIASED_NEXT_HINT: order this step's output so the NEXT
-                          # step's kernel permA (input-ψ reorg, ~14% of wall) is identity.
-                          # Pure index-structure hint from the deterministic operator chain.
-                          _nh = (get(ENV, "SB_ALIASED_NEXT_HINT", "0") == "1" &&
-                                 idx < length(itensor_map)) ?
-                                _dense_chain_hint(Hv, it, itensor_map[idx + 1]) : nothing
+                          # SB_ALIASED_ENABLE has been removed (2026-06), aliased kernel honors the
+                          # NEXT operator in the deterministic chain so the contract function emits THIS
+                          # step's output already in the A-canonical layout (axes the
+                          # next step contracts placed LAST), making the next step's
+                          # kernel permA (input-ψ reorg, the dominant data movement)
+                          # the identity. The index-order computation happens once,
+                          # inside the contract function (not here).
+                          _it_next = if idx < _last_real_idx && !(itensor_map[idx + 1] isa OneITensor)
+                              itensor_map[idx + 1]            # normal: next operator in the chain
+                          elseif idx == _last_real_idx
+                              _first_real_op                  # WRAP-AROUND: first operator of the next matvec
+                          else
+                              nothing
+                          end
+                          _rops = _capture ? _remaining_ops(idx) : nothing
                           Hv = preserve_bs_v ?
                               SparseBackends.contract_preserve_bs(Hv, it; template=nothing,
                                   output_inds_hint=(_use_aa_hint ? _aa_step_hint(Hv, it) : _step_hint),
-                                  preferred_output_labels=_nh) :
+                                  next_op=_it_next, remaining_ops=_rops) :
                               Hv * it
                       end
                       # SB_MATVEC_DIAG: budgeted per-step intermediate-size dump (both backends).
@@ -837,9 +785,11 @@ function ITensors.contract(P::AbstractProjMPO, v::ITensor)::ITensor
             _show_inds_after(t) = [(ITensors.dim(I), string(ITensors.tags(I)), ITensors.plev(I)) for I in inds(t)]
             println("  Hv.inds (AFTER ) = ", _show_inds_after(Hv))
             println("  Hv storage after = $_hv_storage_after")
+            SparseBackends.check_image("step $idx out", Hv)
           end
       end
     end
+    ENV["SB_IN_MATVEC"] = "0"
     if debug
         println("------------------")
     end
@@ -1100,12 +1050,20 @@ const _H2_DBG = Ref(0)
 #   - all other axes keep their relative order.
 # This is a metadata + one-time data move during env construction; downstream
 # matvec contractions then skip their per-call permute_B.
-function _reorder_env_for_aliased(T::ITensor, both_aliased::Bool=false)
+function _reorder_env_for_aliased(T::ITensor, both_aliased::Bool=false, aliased_h::Bool=false)
     # A/B switch: SB_NO_ENV_REORDER=1 disables this standalone env permute so we
     # can measure whether it actually reduces the matvec's permute_B@step-2 (the
     # fire-counter says it does not) vs just adding a permute in position!.
     get(ENV, "SB_NO_ENV_REORDER", "0") == "1" && return T
-    get(ENV, "SB_FUSE_LINKS", "0") == "1" || return T
+    # Only canonicalize the env for an ALIASED-H run (the matvec will call the
+    # aliased×dense kernel, whose per-call permute_B this reorder eliminates).
+    # For dense-H / BS runs the env feeds a plain ITensors `*`, so reordering is
+    # pointless and would perturb those (byte-identical) baselines. This is the
+    # intrinsic replacement for the old SB_FUSE_LINKS gate — NOTE it must NOT be
+    # gated on "has FusedSparse axes": at sizes with no multi-strand links to
+    # fuse, the env carries plain `Link` tags (nfused=0) yet the [ket, dense-H,
+    # bra] regrouping is still exactly what makes step-2's B canonical.
+    aliased_h || return T
     # Both-aliased (aliased ψ × aliased H) ONLY: the env is aliased here (built by
     # _env_mul) and already carries the correct prefix/dense classification; this
     # reorder is only a perf canonicalization for the DENSE-env matvec kernel, and
@@ -1224,7 +1182,7 @@ function _makeL!(P::AbstractProjMPO, psi::MPS, k::Int; debug=false)::Union{ITens
             # Reorder so "FusedSparse" axes go last → matvec kernel sees
             # canonical layout and skips its per-call permute_B. (Skipped for the
             # both-aliased env inside _reorder_env_for_aliased.)
-            L = _reorder_env_for_aliased(L, _keep_env)
+            L = _reorder_env_for_aliased(L, _keep_env, _is_aliased_itensor(H_site))
             if _env_dbg && _ENV_DBG_COUNT[] <= _env_dbg_max
                 println("  L (after × dag(psi') × psi, post-reorder) FINAL inds = ", inds(L))
                 println("    P.LR[", ll+1, "] stored.  external? ",
@@ -1303,7 +1261,7 @@ function _makeR!(P::AbstractProjMPO, psi::MPS, k::Int; debug=false)::Union{ITens
             end
             R = _env_mul(dag(prime(psi[rl - 1])), R, _keep_env)
             R = _env_mul(psi[rl - 1], R, _keep_env)
-            R = _reorder_env_for_aliased(R, _keep_env)
+            R = _reorder_env_for_aliased(R, _keep_env, _is_aliased_itensor(H_site))
             if _env_dbg2 && _ENV_DBG_COUNT[] <= _env_dbg2_max
                 println("  R (after × dag(psi') × psi, post-reorder) FINAL inds = ", inds(R))
             end
