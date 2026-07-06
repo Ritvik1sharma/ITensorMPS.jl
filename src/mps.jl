@@ -1544,7 +1544,7 @@ function replacebond_sparse!(
     # under uniform-multiplicity storage. SB_USE_QR=1 selects the QR+GS
     # variant (strict iso); SB_USE_OWNED_SVD=1 selects per-cM SVD with
     # primary-ownership (non-iso, used by Path B's M-corrected eigsolve).
-    _tr_alias = get(ENV, "SB_ALIASED_TRACE", "0") == "1"
+    _tr_alias = SparseBackends.ALIASED_TRACE[]
     if _tr_alias
         println("[SB_ALIASED_TRACE replacebond_sparse! ENTRY b=$b]  M[b] = ",
             ITensors.has_external_storage(M[b]) ? typeof(M[b].tensor.data) : "dense",
@@ -1574,9 +1574,14 @@ function replacebond_sparse!(
         end
         L, R, spec
     else
-        factor_fn = if get(ENV, "SB_USE_OWNED_SVD", "0") == "1"
-            SparseBackends.itensor_blocksparse_svd_owned_channel_aware
-        elseif get(ENV, "SB_USE_QR", "0") == "1"
+        # Owned-SVD variant (itensor_blocksparse_svd_owned_channel_aware) disabled:
+        # never exercised by any script, SB_USE_OWNED_SVD always false in practice.
+        # Commented out rather than deleted; uncomment + restore the elseif above
+        # it to re-enable.
+        # if get(ENV, "SB_USE_OWNED_SVD", "0") == "1"
+        #     SparseBackends.itensor_blocksparse_svd_owned_channel_aware
+        # elseif ...
+        factor_fn = if get(ENV, "SB_USE_QR", "0") == "1"
             SparseBackends.itensor_blocksparse_qr_channel_aware
         else
             SparseBackends.itensor_blocksparse_svd_channel_aware
@@ -1619,7 +1624,7 @@ end
 # Allows overloading `replacebond!` based on the projected MPO type.
 # Routes sparse psi through the channel-aware factorization.
 function replacebond!(PH, M::MPS, b::Int, phi::ITensor; kwargs...)
-    if get(ENV, "SB_ALIASED_TRACE", "0") == "1"
+    if SparseBackends.ALIASED_TRACE[]
         println("[SB_ALIASED_TRACE replacebond! ENTRY b=$b]  M[b]=",
             ITensors.has_external_storage(M[b]) ? typeof(M[b].tensor.data) : "dense",
             "  M[b+1]=",
