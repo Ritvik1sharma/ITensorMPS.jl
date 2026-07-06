@@ -406,14 +406,36 @@ function dmrg(
   #   :bop_densify — same B_op but env-dressed + DENSIFIED seed (needs dense L/R envs)
   #   :minner      — A = M^{-1} H_eff, M-inner-product Lanczos
   run_mode::Symbol=:bop_aliased,
-  # Step 2b (from-P M^{±1/2}): when true, build M^{±1/2}=c^{∓...}·G from the geometric
-  # constant c=2^⌈env/2⌉ (no eigen), instead of eigendecomposing the gram. Default nothing
-  # → eigen path unchanged. Optional arg, no env var.
-  minv_from_p::Union{Nothing,Bool}=nothing,
-  debug=false
+  # from-P M^{±1/2}: build M^{±1/2}=c^{∓...}·Lgram from the structural Z2-count
+  # c=2^⌈env/2⌉ (the involution-order × #2-site-rungs count) instead of eigendecomposing
+  # the gram. DEFAULT true — measured ~9% faster/sweep (skips the eigendecomposition,
+  # build_minv 2.23s→0.07s @ N=12 md40) and validated accurate (ΔE≈2.9e-5 vs dense-PHP,
+  # both sectors; cf. eigen 1.2e-5). Set false for the eigendecomposition path (marginally
+  # more accurate). Only affects aliased Path-B runs (dense/isometric ψ skip it). No env var.
+  minv_from_p::Union{Nothing,Bool}=true,
+  debug=false,
+  # Consolidates the old SB_ROOFLINE / SB_FLOP_COUNT / SB_ENV_FOOTPRINT /
+  # SB_PERM_CAPTURE / GEMM_DIMS_HIST env vars (+ SB_PERMUTE_PROFILE's
+  # SparseBackends/ITensorMPS writers) into one switch. Only flips the
+  # enabled flag on every call (via set_roofline!) — does NOT reset the
+  # accumulators, so a per-sweep loop of dmrg(...) calls still accumulates
+  # stats across the whole run. Call SparseBackends.reset_roofline!(true)/
+  # reset_flops!(true) once yourself before such a loop to zero them first.
+  roofline::Bool=false,
+  # Was SB_RUN_LABEL env var — a real threaded argument now (was a functional
+  # argument all along conceptually; test scripts pass it directly instead of
+  # setting ENV), tagging env-footprint/permute-profile records with which
+  # named run ("DENSE"/"ALIASED"/etc.) produced them. No correctness effect.
+  run_label::String="?"
 )
   run_mode in (:iso, :bop_aliased, :bop_densify, :minner) ||
     error("dmrg: unknown run_mode=$(run_mode); expected one of :iso, :bop_aliased, :bop_densify, :minner")
+  # Was SB_ALIASED_TRACE — thread this call's debug flag into SparseBackends'
+  # trace Ref (not an ENV var), consulted by trace prints throughout the
+  # aliased pipeline. Each print site's own fire-count budget is a hardcoded
+  # literal, not separately configurable.
+  SparseBackends.ALIASED_TRACE[] = debug
+  SparseBackends.set_roofline!(roofline)
   println("Use early exit is set to ", use_early_exit, " num sweeeps are ", nsweep(sweeps))
   if length(psi0) == 1
     error(
@@ -444,7 +466,7 @@ function dmrg(
   end
 
   t = @elapsed begin
-    PH = position!(PH, psi, 1; debug=false)
+    PH = position!(PH, psi, 1; debug=false, roofline=roofline, run_label=run_label)
   end
 
   println("Time to position at start of DMRG: ", t, " seconds")
@@ -503,12 +525,10 @@ function dmrg(
             ENV["SB_BOND"] = string(b)
             @timeit PROJMPO_TIMER "dmrg.position!" begin
               ITensorMPS._IN_POSITION[] = true
-              ENV["SB_IN_POSITION"] = "1"
               try
-                PH = position!(PH, psi, b)
+                PH = position!(PH, psi, b; roofline=roofline, run_label=run_label)
               finally
                 ITensorMPS._IN_POSITION[] = false
-                ENV["SB_IN_POSITION"] = "0"
               end
             end
           end
@@ -519,19 +539,11 @@ function dmrg(
             checkflux(PH)
           end
 
-          @timeit_debug timer "dmrg: psi[b]*psi[b+1]" begin
-            # Manually preserve the aliased output if both inputs are aliased blocksparse 
-            phi = if ITensors.has_external_storage(psi[b]) &&
-                     ITensors.has_external_storage(psi[b + 1]) &&
-                     psi[b].tensor.data isa SparseBackends.WrappedAliasedBlockSparse &&
-                     psi[b + 1].tensor.data isa SparseBackends.WrappedAliasedBlockSparse
-              Aw = ITensors.get_external_storage(psi[b])
-              Bw = ITensors.get_external_storage(psi[b + 1])
-              Cw = SparseBackends.wrapped_contract_aliased(Aw, Bw; preserve_bs_output=true)
-              Cw isa ITensors.ITensor ? Cw : ITensors._itensor_from_external_storage(Cw)
-            else
-              psi[b] * psi[b + 1]
-            end
+          @timeit PROJMPO_TIMER "dmrg.phi_build" begin
+            # `preserve_bs_output=true` routes through ITensors' `*` to the aliased-
+            # preserving contraction when both site tensors are aliased blocksparse
+            # (and is a no-op for dense inputs), so φ keeps its aliased/dedup schema.
+            phi = *(psi[b], psi[b + 1]; preserve_bs_output=true)
           end
           # WRAP-AROUND (Part B): put φ (the eigensolver seed + recast template)
           # into the order the matvec's FIRST step wants, so step-1's permA is the
@@ -545,33 +557,40 @@ function dmrg(
             # this can't be a single hard-coded vector like the per-step output
             # table), but it's a once-per-bond template setup, not per-matvec. Build
             # the chain via the same reverse gate the matvec uses.
-            _ops = Union{ITensor,OneITensor}[lproj(PH)]
-            for s in site_range(PH); push!(_ops, PH.H[s]); end
-            push!(_ops, rproj(PH))
-            (first(_ops) isa OneITensor) && reverse!(_ops)
-            phi = SparseBackends.reorder_aliased_by_rank(phi, _ops)
+            @timeit PROJMPO_TIMER "dmrg.phi_reorder" begin
+              _ops = Union{ITensor,OneITensor}[lproj(PH)]
+              for s in site_range(PH); push!(_ops, PH.H[s]); end
+              push!(_ops, rproj(PH))
+              (first(_ops) isa OneITensor) && reverse!(_ops)
+              phi = SparseBackends.reorder_aliased_by_rank(phi, _ops)
+            end
           end
 
           SparseBackends.schema_dbg("eigsolve-OPERAND phi b=$b", phi)
 
-          if get(ENV, "SB_FACT_DIAG", "0") == "1"
-            _clsdump(lbl, T) = begin
-              if ITensors.has_external_storage(T) && T.tensor.data isa SparseBackends.WrappedAliasedBlockSparse
-                w = T.tensor.data; P = SparseBackends._abs_head_len(w); N = ndims(w.aliased)
-                println("   [", lbl, "] P=$P  prefix=",
-                        [(ITensors.dim(w.inds[i]), string(ITensors.tags(w.inds[i])), ITensors.plev(w.inds[i])) for i in 1:P],
-                        "  dense=",
-                        [(ITensors.dim(w.inds[i]), string(ITensors.tags(w.inds[i])), ITensors.plev(w.inds[i])) for i in P+1:N])
-              else
-                println("   [", lbl, "] storage=", ITensors.has_external_storage(T) ? string(typeof(T.tensor.data)) : "dense")
-              end
-            end
-            println("[FACT_DIAG phi @ b=$b ha=$ha sw=$sw]")
-            _clsdump("psi[b]",   psi[b])
-            _clsdump("psi[b+1]", psi[b+1])
-            _clsdump("phi",      phi)
-            flush(stdout)
+          # Dumps psi[b]/psi[b+1]/phi's prefix/dense axis classification before
+          # the eigsolve. Debug-only, disabled; flip to `true` (and restore the
+          # body below) to re-enable.
+          if false
           end
+          # if get(ENV, "SB_FACT_DIAG", "0") == "1"
+          #   _clsdump(lbl, T) = begin
+          #     if ITensors.has_external_storage(T) && T.tensor.data isa SparseBackends.WrappedAliasedBlockSparse
+          #       w = T.tensor.data; P = SparseBackends._abs_head_len(w); N = ndims(w.aliased)
+          #       println("   [", lbl, "] P=$P  prefix=",
+          #               [(ITensors.dim(w.inds[i]), string(ITensors.tags(w.inds[i])), ITensors.plev(w.inds[i])) for i in 1:P],
+          #               "  dense=",
+          #               [(ITensors.dim(w.inds[i]), string(ITensors.tags(w.inds[i])), ITensors.plev(w.inds[i])) for i in P+1:N])
+          #     else
+          #       println("   [", lbl, "] storage=", ITensors.has_external_storage(T) ? string(typeof(T.tensor.data)) : "dense")
+          #     end
+          #   end
+          #   println("[FACT_DIAG phi @ b=$b ha=$ha sw=$sw]")
+          #   _clsdump("psi[b]",   psi[b])
+          #   _clsdump("psi[b+1]", psi[b+1])
+          #   _clsdump("phi",      phi)
+          #   flush(stdout)
+          # end
 
           # phi = canonicalize_phi_phase(phi)
 
@@ -609,7 +628,7 @@ function dmrg(
             end
             flush(stdout); return nothing
           end
-          _keytrace("1.phi_original (template)", phi)
+          # _keytrace("1.phi_original (template)", phi)  # disabled — uncomment to re-enable
 
           # println("eigsolve at sweep $sw, half $ha, bond ($b, $(b+1))")
           time = @elapsed begin
@@ -713,8 +732,16 @@ function dmrg(
                   # "byte-identical for dense-H" gate, but it leaves the M^{−1/2} apply
                   # densifying the aliased operand (P=3/dedup→P=2/dense) for dense-H.
                   _minv_both_aliased = _is_aliased_itensor(phi)
-                  # Step 2b: geometric c = 2^⌈env/2⌉ per side (env = #sites contracted into
-                  # that gram). Lgram at bond b = gram of sites 1..b-1; Rgram = sites b+2..N.
+                  # STRUCTURAL Z2-COUNT for c: c = (Z2 involution order)^(#2-site rungs in env).
+                  # Base = order of the constraint symmetry U_j: Cons_j = ½(Id+psign·U_j) with
+                  # U_j a product of single-site π-rotations exp(iπS·); for integer spin S=1,
+                  # exp(iπS)²=exp(2πiS)=Id ⇒ involution ⇒ order 2 (verified in derive_m_from_p.jl:
+                  # ‖exp(iπSy/x)²−Id‖≈1e-15). Exponent = #2-site rungs = ⌈env/2⌉ (env = #sites in
+                  # that gram: Lgram at b = sites 1..b-1; Rgram = sites b+2..N). So per side
+                  # c = 2^⌈env/2⌉, matching the converged gram eigenvalue exactly (64/128 @ N=12).
+                  # NOTE: c is an ON-SHELL count (P acting on the constrained ground state's Z2
+                  # sector) — NOT obtainable by contracting P's tensors (a raw P†P contraction is
+                  # off-shell and picks up the physical dim 3, not the Z2 factor 2; verified).
                   _p_c = if minv_from_p === true
                     _N = length(psi)
                     (2.0^cld(b - 1, 2), 2.0^cld(_N - b - 1, 2))
@@ -725,14 +752,21 @@ function dmrg(
                     SparseBackends.build_minv_half_pair_factored(Lgram, Rgram; phi_template=phi,
                                                                  both_aliased=_minv_both_aliased,
                                                                  p_c=_p_c)
+                  # NOTE (2026-07): a SCALAR M^{±1/2} on aligned operands (seed √c·φ, recovery
+                  # (1/√c)·y, since contract(M_L,φ)=c_L·φ for P-built φ) was tested and REVERTED —
+                  # it converged ~10× further from the dense-PHP ground truth than this full-G
+                  # apply (scalar 1.5e-4/2.6e-3 vs eigen 1.2e-5/2.6e-4 @ N=12 md40 sw25, psign ±1),
+                  # for only a redundant benefit (drop-at-factorize already restores stored dedup).
                 end
 
                 # Recast H_eff output back to phi's aliased/BS classification
                 # (schema-preserving alignment), shared by both eigsolve paths.
-                # SB_RECAST_DEDUP_CHK=1: after each recast, compare the OUTPUT's dedup
-                # (nb/nt) + sparsity (nb, key-set) to φ's — to confirm the recast restores
-                # φ's compression/sparsity (if not, Krylov vectors stay de-deduped and the
-                # adds churn). Per-bond latch, capped at SB_RECAST_DEDUP_CHK_MAX (default 8).
+                # _recast_dedup_chk_on (was SB_RECAST_DEDUP_CHK=1): after each recast,
+                # compare the OUTPUT's dedup (nb/nt) + sparsity (nb, key-set) to φ's — to
+                # confirm the recast restores φ's compression/sparsity (if not, Krylov
+                # vectors stay de-deduped and the adds churn). Per-bond latch, capped at
+                # the hardcoded budget below (was SB_RECAST_DEDUP_CHK_MAX, default 8).
+                _recast_dedup_chk_on = false
                 _recast_chk = Ref(0)
                 recast_to_phi = function(Hv)
                   if ITensors.has_external_storage(Hv) && ITensors.has_external_storage(phi)
@@ -771,8 +805,8 @@ function dmrg(
                           ITensors._itensor_from_external_storage(
                               SparseBackends.recast_aliased_to_template(Cw, Tw))
                       end
-                      if get(ENV, "SB_RECAST_DEDUP_CHK", "0") == "1" &&
-                         _recast_chk[] < parse(Int, get(ENV, "SB_RECAST_DEDUP_CHK_MAX", "8")) &&
+                      if _recast_dedup_chk_on &&
+                         _recast_chk[] < 8 &&
                          ITensors.has_external_storage(out)
                         _recast_chk[] += 1
                         Ow = ITensors.get_external_storage(out).aliased; Pw = Tw.aliased
@@ -833,25 +867,13 @@ function dmrg(
                   # All M^{±1/2} applies go through apply_minv_preserve_bs, which is
                   # schema-preserving, so (keys, alias_ids, scalars) — i.e. P's action
                   # — are untouched; only the template values transform.
-                  # SB_STEP_IDX_DBG=1: dump the M^{±1/2}-apply index order (the "Minv" steps of
-                  # the B = M^{-1/2}·H_eff·M^{-1/2} chain). Combine with SB_KRYLOV_IDX_DBG (Lenv/
-                  # H1/H2/Renv operators + B(y) IN/OUT) and TRACE_BOND (per-step intermediates)
-                  # for the full Minv→Lenv→H1→H2→Renv→Minv index trace. Per-bond latch.
-                  _step_idx_n = Ref(0)
+                  # SB_STEP_IDX_DBG / SB_KRYLOV_IDX_DBG removed 2026-06 (dumped the M^{±1/2}-apply
+                  # index order around each apply_minv_preserve_bs call). Debug-print only; no
+                  # numeric effect. Removed rather than if-false'd since neither is likely to be
+                  # needed again in this form — re-add a println here if similar tracing is needed.
                   apply_half = function(opL, opR, z; fission::Bool=true)
-                    _sidbg = get(ENV, "SB_STEP_IDX_DBG", "0") == "1" &&
-                             _step_idx_n[] < parse(Int, get(ENV, "SB_STEP_IDX_DBG_MAX", "12"))
-                    if _sidbg
-                      _step_idx_n[] += 1
-                      println("[STEP_IDX #", _step_idx_n[], " b=", b, " sw=", sw,
-                              "] Minv-apply IN  inds=", collect(ITensors.inds(z)))
-                    end
                     z = SparseBackends.apply_minv_preserve_bs(opL, z, phi; fission)
                     z = SparseBackends.apply_minv_preserve_bs(opR, z, phi; fission)
-                    if _sidbg
-                      println("[STEP_IDX #", _step_idx_n[], " b=", b, " sw=", sw,
-                              "] Minv-apply OUT inds=", collect(ITensors.inds(z)))
-                    end
                     return z
                   end
                   # Deferred-fission  onthe PRE-H apply_half (HARDENED 2026-06): its output
@@ -922,17 +944,16 @@ function dmrg(
                       return env
                     end
                     try
-                      (_L0 isa ITensor) && (PH.LR[_lpos] = _dress_env(_L0, Linv_L))
-                      (_R0 isa ITensor) && (PH.LR[_rpos] = _dress_env(_R0, Linv_R))
-                      # SB_KRYLOV_IDX_DBG: dump the ITensor index orders of the tensors in
-                      # the Krylov matvec (operator pieces once; operand y IN / B(y) OUT per
-                      # matvec) for selected bonds — to see exactly which leg order the kernel
-                      # receives vs emits (the leg order printed IS the kernel's label order).
-                      # SB_KRYLOV_IDX_BONDS (default "1,3,5") picks bonds (1 = left edge, last
-                      # = right edge for a 6-site N=2 chain); SB_KRYLOV_IDX_SWEEP picks the sweep.
-                      _kdbg_bonds = Set(parse.(Int, split(get(ENV,"SB_KRYLOV_IDX_BONDS","1,3,5"), ",")))
-                      _kdbg = get(ENV,"SB_KRYLOV_IDX_DBG","0")=="1" && (b in _kdbg_bonds) &&
-                              ha == 1 && sw == parse(Int, get(ENV,"SB_KRYLOV_IDX_SWEEP","2"))
+                      @timeit PROJMPO_TIMER "dmrg.env_dress" begin
+                        (_L0 isa ITensor) && (PH.LR[_lpos] = _dress_env(_L0, Linv_L))
+                        (_R0 isa ITensor) && (PH.LR[_rpos] = _dress_env(_R0, Linv_R))
+                      end
+                      # SB_KRYLOV_IDX_DBG removed 2026-06: dumped the ITensor index orders of the
+                      # Krylov matvec's operator pieces + operand y IN / B(y) OUT, for selected
+                      # bonds — to see exactly which leg order the kernel receives vs emits.
+                      # Debug-print only; _kdbg hardcoded false below (was ENV-gated + bond/sweep
+                      # filtered via SB_KRYLOV_IDX_BONDS / SB_KRYLOV_IDX_SWEEP).
+                      _kdbg = false
                       _kn = Ref(0)
                       if _kdbg
                         println("\n===== [KRYLOV-IDX  bond b=$b (sites $b,$(b+1))  ha=$ha sw=$sw  run_mode=$run_mode] =====")
@@ -946,7 +967,8 @@ function dmrg(
                         println("    phi(template) inds = ", ITensors.inds(phi))
                       end
                       B_op = function(y)
-                        out = recast_to_phi(product(PH, y))  # folded M^{−1/2}HM^{−1/2}
+                        _pp = product(PH, y; roofline=roofline, run_label=run_label)
+                        out = @timeit PROJMPO_TIMER "dmrg.recast" recast_to_phi(_pp)  # folded M^{−1/2}HM^{−1/2}
                         if _kdbg && _kn[] < 4
                           _kn[] += 1
                           println("\n  [matvec #$(_kn[])]  (index print order == kernel label order)")
@@ -958,15 +980,15 @@ function dmrg(
                         return out
                       end
                       _densify_solve = run_mode === :bop_densify
-                      # SB_KRYLOV_IDX_DBG: trace sparse-vs-dense classification + fill +
-                      # dedup along the Path-B pipeline at this bond — φ → M^{1/2}·φ (y0) →
-                      # the eigsolve Krylov steps (in B_op above) → recovered φ. (schema_dbg
-                      # self-gates on SB_SCHEMA_DBG, so enable both.)
+                      # Traces sparse-vs-dense classification + fill + dedup along the Path-B
+                      # pipeline at this bond — φ → M^{1/2}·φ (y0) → the eigsolve Krylov steps
+                      # (in B_op above) → recovered φ. schema_dbg self-gates on SB_SCHEMA_DBG;
+                      # _kdbg above is hardcoded false, so these calls are currently no-ops.
                       if _kdbg; SparseBackends.schema_dbg("phi (input)      b=$b", phi); end
                       # y0 = M^{1/2} φ; aliased for :bop_aliased (V stays wrapped through the
                       # solve), densified for :bop_densify (dense BLAS local solve).
-                      y0 = apply_half(Mhalf_L, Mhalf_R, phi)
-                      _keytrace("2.y0 = M^{1/2}*phi (seed, raw)", y0)
+                      y0 = @timeit PROJMPO_TIMER "dmrg.seed_Mhalf" apply_half(Mhalf_L, Mhalf_R, phi)
+                      # _keytrace("2.y0 = M^{1/2}*phi (seed, raw)", y0)  # disabled — uncomment to re-enable
                       if get(ENV, "SB_SNAP_PHI", "0") == "1" &&
                          ITensors.has_external_storage(y0) && ITensors.has_external_storage(phi)
                         _y0w = ITensors.get_external_storage(y0); _pw = ITensors.get_external_storage(phi)
@@ -984,7 +1006,7 @@ function dmrg(
                         _y0w = ITensors.get_external_storage(y0); _pw = ITensors.get_external_storage(phi)
                         if _y0w isa SparseBackends.WrappedAliasedBlockSparse &&
                            _pw isa SparseBackends.WrappedAliasedBlockSparse
-                          if get(ENV, "SB_DROP_KRYLOV_DBG", "0") == "1"
+                          if false   # was SB_DROP_KRYLOV_DBG — flip to true here for debug output
                             _seedset = Set(_pw.aliased.keys)
                             _seed_out = count(k -> !(k in _seedset), _y0w.aliased.keys)
                             println("[SEED_DBG b=", b, " ha=", ha, " sw=", sw,
@@ -1008,10 +1030,10 @@ function dmrg(
                           maxiter     = eigsolve_maxiter,
                           verbosity   = eigsolve_verbosity,
                       )
-                      _keytrace("3.y = eigsolve result (Krylov eigenvector)", yvecs[1])
+                      # _keytrace("3.y = eigsolve result (Krylov eigenvector)", yvecs[1])  # disabled — uncomment to re-enable
                       # φ = M^{−1/2} y. :bop_aliased keeps it aliased; :bop_densify re-imposes
                       # φ's keys (operand was dense) so replacebond!'s factorize rebuilds dedup.
-                      vecs = [begin
+                      vecs = @timeit PROJMPO_TIMER "dmrg.recover_Minv" ([begin
                                 _phi = apply_half(Linv_L, Linv_R, y)
                                 _densify_solve ?
                                     SparseBackends.wrap_dense_as_aliased_via_template(
@@ -1019,8 +1041,8 @@ function dmrg(
                                             SparseBackends.to_dense_itensors_unfused(_phi) : _phi,
                                         phi) :
                                     _phi
-                              end for y in yvecs]
-                      _keytrace("4.recovered phi = M^{-1/2}*y", vecs[1])
+                              end for y in yvecs])
+                      # _keytrace("4.recovered phi = M^{-1/2}*y", vecs[1])  # disabled — uncomment to re-enable
                       if _kdbg; SparseBackends.schema_dbg("recovered phi = M^{-1/2}*y b=$b", vecs[1]); end
                     finally
                       (_L0 isa ITensor) && (PH.LR[_lpos] = _L0)
@@ -1031,11 +1053,14 @@ function dmrg(
                   # aliased through the solve. (run_mode=:bop_densify already errored above.)
                   B_op = function(y)
                     x  = apply_half(Linv_L, Linv_R, y; fission = false)  # M^{−1/2} y (big-block)
-                    Hx = recast_to_phi(product(PH, x))         # H_eff M^{−1/2} y
+                    Hx = recast_to_phi(product(PH, x; roofline=roofline, run_label=run_label))         # H_eff M^{−1/2} y
                     return apply_half(Linv_L, Linv_R, Hx)      # M^{−1/2} H_eff M^{−1/2} y
                   end
                   y0 = apply_half(Mhalf_L, Mhalf_R, phi)       # y0 = M^{1/2} φ
-                  if get(ENV, "SB_PHI_Y0_DEDUP", "0") == "1"
+                  # Was SB_PHI_Y0_DEDUP=1 — flip to `if true` to re-investigate whether
+                  # M^{1/2} preserves φ's dedup (per project_minv_half_destroys_dedup:
+                  # it doesn't — φ's dedup collapses to 1.0x at every bond before eigsolve).
+                  if false
                     println("\n===== [SB_PHI_Y0_DEDUP b=", b, " ha=", ha, " sw=", sw,
                             "] does M^{1/2} preserve φ's dedup? =====")
                     _dump_aliased_schema("phi          ", phi; max_blocks=0)
@@ -1075,7 +1100,7 @@ function dmrg(
                        _pw0 isa SparseBackends.WrappedAliasedBlockSparse
                       _rc0 = SparseBackends.recast_aliased_to_template(_vw0, _pw0)
                       if _rc0 isa SparseBackends.WrappedAliasedBlockSparse
-                        if get(ENV, "SB_DROP_AT_FACT_DBG", "0") == "1"
+                        if false  # SB_DROP_AT_FACT_DBG removed 2026-06 — flip to true here for debug output
                           println("[DROP_AT_FACT b=", b, " ha=", ha, " sw=", sw,
                                   "] phi_recovered nb=", length(_rc0.aliased.keys),
                                   " nt=", _rc0.aliased.n_templates,
@@ -1122,7 +1147,7 @@ function dmrg(
                 # Hermitian Lanczos (the old BMF_APPLY_MINV=0 / BMF_ARNOLDI=1 corners
                 # are dropped — no test used them).
                 H_op = function(v)
-                  Hv = recast_to_phi(product(PH, v[]))
+                  Hv = recast_to_phi(product(PH, v[]; roofline=roofline, run_label=run_label))
                   Av = apply_Minv(Hv)
                   return InnerProductVec(Av, M_dot)
                 end
@@ -1201,8 +1226,8 @@ function dmrg(
             vecs[1]
           end
           SparseBackends.schema_dbg("eigsolve-RESULT phi b=$b", phi)
-          _keytrace("5.phi before factorize (= vecs[1], post any drop)", phi)
-          if get(ENV, "SB_ALIASED_TRACE", "0") == "1" && _EIGSOLVE_PHI_TRACE_COUNT[] < 5
+          # _keytrace("5.phi before factorize (= vecs[1], post any drop)", phi)  # disabled — uncomment to re-enable
+          if SparseBackends.ALIASED_TRACE[] && _EIGSOLVE_PHI_TRACE_COUNT[] < 5
             _EIGSOLVE_PHI_TRACE_COUNT[] += 1
             phi_st = ITensors.has_external_storage(phi) ? typeof(phi.tensor.data) : "dense"
             println("[SB_ALIASED_TRACE eigsolve returned #$(_EIGSOLVE_PHI_TRACE_COUNT[])]  phi storage=$phi_st  b=$b")
@@ -1229,16 +1254,19 @@ function dmrg(
             replace_debug = true
           end
 
-          # ── FACT_KEY (before/after factorize key diff, SB_FACT_KEY_DBG=1) ──────
+          # ── FACT_KEY (before/after factorize key diff) ──────────────────────
           # Capture φ's key set going INTO replacebond!, then reconstitute the
           # post-SVD two-site tensor and diff: keys in φ but gone after = what the
           # factorize truncation actually discards (the provably-safe-to-drop set).
-          _factkey = get(ENV, "SB_FACT_KEY_DBG", "0") == "1"
+          # Debug-only, disabled; flip to `true` (and restore the two bodies —
+          # here and further below at the matching `if _factkey` block) to
+          # re-enable.
+          _factkey = false
           _fk_in = nothing
-          if _factkey && ITensors.has_external_storage(phi) &&
-             ITensors.get_external_storage(phi) isa SparseBackends.WrappedAliasedBlockSparse
-            _fk_in = Set(ITensors.get_external_storage(phi).aliased.keys)
-          end
+          # if _factkey && ITensors.has_external_storage(phi) &&
+          #    ITensors.get_external_storage(phi) isa SparseBackends.WrappedAliasedBlockSparse
+          #   _fk_in = Set(ITensors.get_external_storage(phi).aliased.keys)
+          # end
           t = @elapsed begin
             @timeit PROJMPO_TIMER "dmrg.replacebond!" begin
               spec = replacebond!(
@@ -1257,26 +1285,26 @@ function dmrg(
               )
             end
           end
-          if _factkey && _fk_in !== nothing
-            try
-              _phiw = ITensors.get_external_storage(phi)
-              _aw = ITensors.get_external_storage(psi[b]); _bw = ITensors.get_external_storage(psi[b+1])
-              _rw = SparseBackends.wrapped_contract_aliased(_aw, _bw; preserve_bs_output=true)
-              _rw = _rw isa ITensors.ITensor ? ITensors.get_external_storage(_rw) : _rw
-              if _rw isa SparseBackends.WrappedAliasedBlockSparse
-                _rw = SparseBackends.recast_aliased_to_template(_rw, _phiw)   # align axes to φ
-                _rw = _rw isa ITensors.ITensor ? ITensors.get_external_storage(_rw) : _rw
-              end
-              _outkeys = (_rw isa SparseBackends.WrappedAliasedBlockSparse) ? Set(_rw.aliased.keys) : Set(eltype(_fk_in)[])
-              _dropped = setdiff(_fk_in, _outkeys); _added = setdiff(_outkeys, _fk_in)
-              println("[FACT_KEY b=", b, " ha=", ha, " sw=", sw, "] phi_in=", length(_fk_in),
-                      " recon_out=", length(_outkeys), " dropped(in∖out)=", length(_dropped),
-                      " added(out∖in)=", length(_added))
-              flush(stdout)
-            catch e
-              println("[FACT_KEY b=", b, "] recon failed: ", sprint(showerror, e)); flush(stdout)
-            end
-          end
+          # if _factkey && _fk_in !== nothing
+          #   try
+          #     _phiw = ITensors.get_external_storage(phi)
+          #     _aw = ITensors.get_external_storage(psi[b]); _bw = ITensors.get_external_storage(psi[b+1])
+          #     _rw = SparseBackends.wrapped_contract_aliased(_aw, _bw; preserve_bs_output=true)
+          #     _rw = _rw isa ITensors.ITensor ? ITensors.get_external_storage(_rw) : _rw
+          #     if _rw isa SparseBackends.WrappedAliasedBlockSparse
+          #       _rw = SparseBackends.recast_aliased_to_template(_rw, _phiw)   # align axes to φ
+          #       _rw = _rw isa ITensors.ITensor ? ITensors.get_external_storage(_rw) : _rw
+          #     end
+          #     _outkeys = (_rw isa SparseBackends.WrappedAliasedBlockSparse) ? Set(_rw.aliased.keys) : Set(eltype(_fk_in)[])
+          #     _dropped = setdiff(_fk_in, _outkeys); _added = setdiff(_outkeys, _fk_in)
+          #     println("[FACT_KEY b=", b, " ha=", ha, " sw=", sw, "] phi_in=", length(_fk_in),
+          #             " recon_out=", length(_outkeys), " dropped(in∖out)=", length(_dropped),
+          #             " added(out∖in)=", length(_added))
+          #     flush(stdout)
+          #   catch e
+          #     println("[FACT_KEY b=", b, "] recon failed: ", sprint(showerror, e)); flush(stdout)
+          #   end
+          # end
           SparseBackends.schema_dbg("replacebond-OUT psi[$b]", psi[b])
           SparseBackends.schema_dbg("replacebond-OUT psi[$(b+1)]", psi[b+1])
 
@@ -1443,7 +1471,7 @@ function constrained_dmrg2(
       PH = disk(PH; path=write_path)
     end
   end
-  PH = position!(PH, psi, 1)
+  PH = position!(PH, psi, 1; roofline=roofline, run_label=run_label)
   energy = 0.0
 
 
@@ -1470,7 +1498,7 @@ function constrained_dmrg2(
         end
 
         @timeit_debug timer "dmrg: position!" begin
-          PH = position!(PH, psi, b)
+          PH = position!(PH, psi, b; roofline=roofline, run_label=run_label)
         end
 
         @debug_check begin

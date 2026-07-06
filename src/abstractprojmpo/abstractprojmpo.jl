@@ -43,7 +43,7 @@ function _dump_aliased_schema(label::String, T::ITensor; max_blocks::Int=40)
     nb > max_blocks && println("       … (", nb - max_blocks, " more blocks)")
 end
 
-@inline function _mul_preserve_aliased(A::ITensor, B::ITensor)
+@inline function _mul_preserve_aliased(A::ITensor, B::ITensor; in_position::Bool=false)
     a_ali = _is_aliased_itensor(A)
     b_ali = _is_aliased_itensor(B)
     if !a_ali && !b_ali
@@ -67,9 +67,9 @@ end
         Set{ITensors.Index}(SparseBackends.dense_inds(Bw))
     end
     Cw = SparseBackends.wrapped_contract_aliased(Aw, Bw;
-        preserve_bs_output=true, output_inds_hint=hint)
+        preserve_bs_output=true, output_inds_hint=hint, in_position=in_position)
     C = Cw isa ITensor ? Cw : ITensors._itensor_from_external_storage(Cw)
-    if get(ENV, "SB_ALIASED_TRACE", "0") == "1"
+    if SparseBackends.ALIASED_TRACE[]
         if ITensors.has_external_storage(C) &&
            C.tensor.data isa SparseBackends.WrappedAliasedBlockSparse
             ali = C.tensor.data.aliased
@@ -112,15 +112,18 @@ _p(::SparseBackends.AliasedBlockSparse{T,N,N2,P,K}) where {T,N,N2,P,K} = ntuple(
 end
 
 @inline function _env_mul(A, B, keep::Bool)
+    # _env_mul is only ever called from _makeL!/_makeR! (position!'s
+    # env-building code) — structurally always "position", so in_position=true
+    # is hardcoded below rather than threaded (was SB_IN_POSITION env var).
     if keep && A isa ITensor && B isa ITensor
-        return _mul_preserve_aliased(A, B)
+        return _mul_preserve_aliased(A, B; in_position=true)
     end
     # Honest FLOP accounting: count PURE dense×dense env-build contractions here.
     # If either operand is aliased, `A * B` routes through the aliased kernel,
     # which counts itself — gating on !aliased avoids double-counting.
     if SparseBackends._flop_count_enabled() && A isa ITensor && B isa ITensor &&
        !_is_aliased_itensor(A) && !_is_aliased_itensor(B)
-        SparseBackends.add_dense_macs!(_union_dim_macs(A, B))
+        SparseBackends.add_dense_macs!(_union_dim_macs(A, B), true)
     end
     return A * B
 end
@@ -134,15 +137,14 @@ const PROJMPO_TIMER = TimerOutput()
 const _DENSEDENSE_DUMP_COUNT = Ref{Int}(0)
 const _SPARSEDENSE_DUMP_COUNT = Ref{Int}(0)
 const _DENSE_INDS_BUDGET = Ref{Int}(20)
-const _MV_DIAG_BUDGET = Ref{Int}(-1)   # SB_MATVEC_DIAG per-step size dump budget (lazy-init from ENV)
 # Single-matvec trace: when TRACE_BOND env is set (e.g., "3"), dump full
 # pre/post indices for EVERY contract step of the FIRST product() call at
 # that bond. After firing once, this latch becomes false to avoid floods.
 const _TRACE_BOND_FIRED = Ref{Bool}(false)
 
-# Permute profile logger gated by SB_PERMUTE_PROFILE=<path>. Captures, for every
-# matvec/position! kernel call, the input/output structure plus the time spent
-# in permutes vs GEMM. Tagged with call-site (matvec | position).
+# Permute profile logger, gated by the roofline switch (was SB_PERMUTE_PROFILE=<path>).
+# Captures, for every matvec/position! kernel call, the input/output structure
+# plus the time spent in permutes vs GEMM. Tagged with call-site (matvec | position).
 const _IN_POSITION = Ref{Bool}(false)
 const _BOND_POSITION = Ref{Int}(-1)   # set by dmrg.jl before each matvec
 const _SWEEP_NUM = Ref{Int}(-1)
@@ -152,7 +154,7 @@ const _RUN_LABEL = Ref{String}("?")   # set by dmrg.jl: "DENSE" or "SPARSE"
 function _permute_profile_io()
     if !_PERMUTE_PROFILE_INIT[]
         _PERMUTE_PROFILE_INIT[] = true
-        path = get(ENV, "SB_PERMUTE_PROFILE", "")
+        path = SparseBackends._roofline_on() ? SparseBackends._RF_PERMUTE_PATH[] : ""
         if !isempty(path)
             # Append mode so SparseBackends's parallel writer can also write
             # to the same path without coordination. Columns:
@@ -172,18 +174,19 @@ function _permute_profile_io()
     end
     return _PERMUTE_PROFILE_IO[]
 end
-function permute_profile_site()
+function permute_profile_site(run_label::String="?")
     base = _IN_POSITION[] ? "position" : "matvec"
-    run  = get(ENV, "SB_RUN_LABEL", "?")
     bond = get(ENV, "SB_BOND", "-1")
-    step = get(ENV, "SB_STEP", "-1")
-    return string(base, "|", run, "|", bond, "|", step)
+    step = something(SparseBackends.CURRENT_STEP[], -1)
+    return string(base, "|", run_label, "|", bond, "|", step)
 end
 
-DEBUG_FLAG = get(ENV, "INDEX_DEBUG", "0") == "1"
+# INDEX_DEBUG removed 2026-06 — was the master switch for DEBUG_FLAG, which gates
+# a family of `if debug` prints in ITensors.contract below. Hardcoded off.
+DEBUG_FLAG = false
 
-# ── Env-footprint recorder (gated by SB_ENV_FOOTPRINT=1) ──────────────────────
-# Records, per (SB_RUN_LABEL, site), a snapshot of the env tensor stored in
+# ── Env-footprint recorder (gated by the roofline switch) ────────────────────
+# Records, per (CURRENT_RUN_LABEL, site), a snapshot of the env tensor stored in
 # P.LR[site]: its leg structure (inds+dims), real bytes, storage kind, and the
 # dense-equivalent bytes. Keyed by site so the LAST build (steady-state, largest
 # bond dim) overwrites earlier sweeps. Call print_env_footprint() to dump a
@@ -192,10 +195,8 @@ DEBUG_FLAG = get(ENV, "INDEX_DEBUG", "0") == "1"
 # BOTH H and ψ, and may lose channel sparsity).
 const _ENV_FP = Dict{Tuple{String,Int},NamedTuple}()
 
-function _record_env_footprint(site::Int, T)
-    get(ENV, "SB_ENV_FOOTPRINT", "0") == "1" || return nothing
+function _record_env_footprint(site::Int, T, label::String="?")
     (T isa ITensor) || return nothing
-    label = get(ENV, "SB_RUN_LABEL", "?")
     is = collect(inds(T))
     dims = [ITensors.dim(I) for I in is]
     dense_equiv_bytes = (isempty(dims) ? 1 : prod(dims)) * 16   # ComplexF64 worst case
@@ -216,8 +217,10 @@ function _record_env_footprint(site::Int, T)
 end
 
 _kib(b) = round(b/1024, digits=2)
+# Was gated on SB_ENV_FOOTPRINT env var; now (like show_roofline/show_cas_stats)
+# just reports whatever _ENV_FP accumulated — empty unless a dmrg(...; roofline=true)
+# call populated it via _record_env_footprint.
 function print_env_footprint(; labelA="ALI", labelB="DEN")
-    get(ENV, "SB_ENV_FOOTPRINT", "0") == "1" || return nothing
     sites = sort(unique(k[2] for k in keys(_ENV_FP)))
     println("\n========== ENV FOOTPRINT (P.LR per site; latest/steady-state build) ==========")
     println("  legend: bytes = Base.summarysize of the env ITensor; dims = env leg dims ",
@@ -243,7 +246,7 @@ function print_env_footprint(; labelA="ALI", labelB="DEN")
     if totA > 0 && totB > 0
         println("  --- TOTAL env bytes: $labelA=$(_kib(totA))KiB  $labelB=$(_kib(totB))KiB  ratio=$(round(totA/max(totB,1),digits=3)) (want < 1) ---")
     else
-        println("  --- TOTAL env bytes: $labelA=$(_kib(totA))KiB  $labelB=$(_kib(totB))KiB (one side missing — set SB_RUN_LABEL per run) ---")
+        println("  --- TOTAL env bytes: $labelA=$(_kib(totA))KiB  $labelB=$(_kib(totB))KiB (one side missing — set SparseBackends.CURRENT_RUN_LABEL[] per run) ---")
     end
     return nothing
 end
@@ -331,61 +334,24 @@ function _permute_env_to_canonical!(P::AbstractProjMPO, idx::Int)
     P.LR[idx] = permute(T, target...)
 end
 
-function ITensors.contract(P::AbstractProjMPO, v::ITensor)::ITensor
+function ITensors.contract(P::AbstractProjMPO, v::ITensor; roofline::Bool=false, run_label::String="?")::ITensor
     global DEBUG_FLAG
-    if get(ENV, "SB_PREPERMUTE_ENVS", "0") == "1"
-        _permute_env_to_canonical!(P, P.lpos)
-        _permute_env_to_canonical!(P, P.rpos)
-    end
+    # Also set the Ref for contract_bs_dense.jl's shared writer, which is
+    # reached via generic dispatch (no argument-carrying call chain from here).
+    SparseBackends.CURRENT_RUN_LABEL[] = run_label
+    # Pre-order each env (Lenv/Renv) so FusedSparse axes trail — once per bond
+    # (idempotent: subsequent matvecs at the same bond find it canonical and skip),
+    # so the per-matvec permB/conv on the env-contracting steps (1 & 4) is cheaper.
+    # HARDENED 2026-07-05 (was SB_PREPERMUTE_ENVS): bit-identical E, conv −49% / permB
+    # −28% on the dense-H aliased-ψ matvec; no-op for dense ψ (env has no FusedSparse
+    # tags → early return in _permute_env_to_canonical!).
+    _permute_env_to_canonical!(P, P.lpos)
+    _permute_env_to_canonical!(P, P.rpos)
     itensor_map = Union{ITensor, OneITensor}[lproj(P)]
 
-    # SB_PRECONTRACT_H=1: precompute H2 = H[k]*H[k+1] per matvec (no caching).
-    # Lets us measure raw per-matvec H2 build cost and how that interacts with
-    # the rest of the chain.
     sr = site_range(P)
-    function _is_aliased(T)
-        ITensors.has_external_storage(T) &&
-            T.tensor.data isa SparseBackends.WrappedAliasedBlockSparse
-    end
-    _h2_eligible = (get(ENV, "SB_PRECONTRACT_H", "0") == "1" &&
-                    length(sr) == 2 &&
-                    _is_aliased(P.H[sr[1]]) && _is_aliased(P.H[sr[2]]))
-    if _h2_eligible
-        @timeit PROJMPO_TIMER "H2_build" begin
-            Hk  = P.H[sr[1]]
-            Hk1 = P.H[sr[2]]
-            # Dense links of H[k] are those tagged "Link" but NOT "FusedSparse".
-            # Works regardless of whether H[k] still has aliased external storage.
-            function _dl(T)
-                n = 0
-                for I in inds(T)
-                    ts = string(tags(I))
-                    if contains(ts, "Link") && !contains(ts, "FusedSparse")
-                        n += 1
-                    end
-                end
-                return n
-            end
-            dLA = _dl(Hk)
-            dLB = _dl(Hk1)
-            if _H2_DBG[] < 2
-                _H2_DBG[] += 1
-                println("[H2 build] sr=", sr,
-                        "  Hk external? ", ITensors.has_external_storage(Hk),
-                        "  storage type = ",
-                        ITensors.has_external_storage(Hk) ? typeof(Hk.tensor.data) : "N/A",
-                        "  dLA=", dLA, "  dLB=", dLB)
-            end
-            H2 = SparseBackends.contract_aliased_itensor(Hk, Hk1,
-                :aliased, :aliased;
-                denseLinksA=dLA, denseLinksB=dLB,
-                preserve_bs_output=true)
-        end
-        push!(itensor_map, H2)
-    else
-        # push!(itensor_map, reduce(*, P.H[site_range(P)]))
-        append!(itensor_map, P.H[sr])
-    end
+    # push!(itensor_map, reduce(*, P.H[site_range(P)]))
+    append!(itensor_map, P.H[sr])
 
     push!(itensor_map, rproj(P))
     SparseBackends.schema_dbg("HENV lproj (Lenv)", itensor_map[1])
@@ -419,9 +385,9 @@ function ITensors.contract(P::AbstractProjMPO, v::ITensor)::ITensor
     # from v's dense_inds. Gated because in-kernel hint support isn't done yet.
     v_dense_hint = if preserve_bs_v
       vw = ITensors.get_external_storage(v)
-      if vw isa SparseBackends.WrappedBlockSparse && get(ENV, "BMF_USE_HINT", "0") == "1"
-        # BS: gated behind BMF_USE_HINT=1 (legacy gate; kernel-side hint
-        # support is partial).
+      if vw isa SparseBackends.WrappedBlockSparse && false
+        # BS: UNSAFE, kept hardcoded off (was BMF_USE_HINT=1, default-off
+        # knob; in-kernel hint support was never finished — do not enable).
         SparseBackends.dense_inds(vw)
       elseif vw isa SparseBackends.WrappedAliasedBlockSparse
         # Aliased: always pass v's dense_inds as hint so matvec output keeps
@@ -440,7 +406,7 @@ function ITensors.contract(P::AbstractProjMPO, v::ITensor)::ITensor
     if DEBUG_FLAG && position == 3
         debug = true
     end
-    if get(ENV, "INDEX_DEBUG", "0") == "1"
+    if false  # INDEX_DEBUG removed 2026-06 — flip to true here for debug output
         println("Contracting ProjMPO at position ", position, " ", debug, " ", DEBUG_FLAG)
     end
 
@@ -462,8 +428,13 @@ function ITensors.contract(P::AbstractProjMPO, v::ITensor)::ITensor
     # Only worth checking H when ψ is aliased (cases 2 & 4). Avoids the P.H[range]
     # slice allocation on every matvec of the all-dense / dense-ψ paths.
     _H_is_aliased = _v_is_aliased && any(i -> _is_aliased_itensor(P.H[i]), site_range(P))
-    _use_aa_hint = _v_is_aliased && _H_is_aliased &&
-        get(ENV, "SB_ALIASED_AA_HINT", "1") == "1"
+    # Hardened 2026-06 — always on (was SB_ALIASED_AA_HINT, default-on knob).
+    _use_aa_hint = _v_is_aliased && _H_is_aliased
+    # Dense-H aliased-ψ ONLY: recycle each consumed matvec intermediate's template
+    # buffer back into the pending pool (see SparseBackends.recycle_aliased_pending!)
+    # so the next step reuses its capacity instead of allocating a fresh result-sized
+    # buffer. Guarded off for both-aliased / dense-ψ / BS ⇒ those paths byte-identical.
+    _recycle_intermediates = _v_is_aliased && !_H_is_aliased
     # Union of the CURRENT operands' dense axes (only the aliased ones contribute).
     @inline function _aa_step_hint(Hvc::ITensor, itc::ITensor)
         s = Set{ITensors.Index}()
@@ -476,27 +447,10 @@ function ITensors.contract(P::AbstractProjMPO, v::ITensor)::ITensor
         return s
     end
 
-    # Flip detector (SB_HAMPSI_DIAG, default off → zero overhead on every other
-    # path): φ's sparse-prefix ids are the authoritative "channels". Flags the
-    # FIRST matvec step whose Hv has a channel id sitting in its DENSE tail — the
-    # exact step that wrongly moved a sparse index to the dense region.
-    _hampsi_diag = get(ENV, "SB_HAMPSI_DIAG", "0") == "1"
-    _v_channel_ids = Set{UInt64}()
-    _flip_flagged = Ref(false)
-    if _hampsi_diag && _v_is_aliased
-        _vw = ITensors.get_external_storage(v)
-        _vP = SparseBackends._abs_head_len(_vw)
-        for i in 1:_vP; push!(_v_channel_ids, ITensors.id(_vw.inds[i])); end
-    end
-
-    # TRACE_BOND: one-shot full-step dump of a single product(P, v) call at
-    # the chosen bond. Captures inputs (it, Hv), shared inds, output Hv per step.
-    trace_bond_target = get(ENV, "TRACE_BOND", "")
-    _trace_label = get(ENV, "TRACE_LABEL", "")
-    do_trace = !isempty(trace_bond_target) && !_TRACE_BOND_FIRED[] &&
-               get(ENV, "SB_BOND", "") == trace_bond_target &&
-               get(ENV, "SB_IN_WARMUP", "0") != "1" &&
-               (isempty(_trace_label) || get(ENV, "SB_RUN_LABEL", "") == _trace_label)
+    # TRACE_BOND / TRACE_LABEL removed 2026-06: one-shot full-step dump of a single
+    # product(P, v) call at a chosen bond. Debug-print only. do_trace hardcoded
+    # false below.
+    do_trace = false
     if do_trace
       _TRACE_BOND_FIRED[] = true
       _show_inds(t) = [(ITensors.dim(I), string(ITensors.tags(I)), ITensors.plev(I)) for I in inds(t)]
@@ -528,26 +482,22 @@ function ITensors.contract(P::AbstractProjMPO, v::ITensor)::ITensor
     _bondtype = (lproj(P) isa OneITensor) ? :left :
                 (rproj(P) isa OneITensor) ? :right : :bulk
     ENV["SB_BONDTYPE"] = string(_bondtype)
-    # GENERATOR (SB_PERM_CAPTURE): the remaining real operators after step i, used by
-    # `_canon_by_rank` to derive the reduction-last order and print the per-(bond-type,
-    # step) permutation to bake into STATIC_OUTPUT_PERM. The LAST step wraps around to
-    # the first operator (its output becomes the next matvec's input φ). Off in
+    # GENERATOR (was SB_PERM_CAPTURE, now the roofline argument): the remaining
+    # real operators after step i, used by `_canon_by_rank` to derive the
+    # reduction-last order and print the per-(bond-type, step) permutation to
+    # bake into STATIC_OUTPUT_PERM. The LAST step wraps around to the first
+    # operator (its output becomes the next matvec's input φ). Off in
     # production (table-only path); `nothing` ⇒ no operands piped to the live kernel.
-    _capture = get(ENV, "SB_PERM_CAPTURE", "0") == "1"
+    _capture = roofline
     _remaining_ops(i) = i == _last_real_idx ? Any[_first_real_op] :
         Any[itensor_map[j] for j in (i+1):_last_real_idx if !(itensor_map[j] isa OneITensor)]
-    # Bracket the matvec chain: the static output-perm table is keyed by the
-    # (SB_BONDTYPE, SB_STEP) coordinate set in this loop, and that coordinate is
-    # only meaningful here. _static_output_pref consults the table iff SB_IN_MATVEC
-    # is "1", so non-matvec aliased contractions (orthogonalize!, env builds) never
-    # apply a stale perm. Must be reset to "0" on every exit path from the loop.
-    ENV["SB_IN_MATVEC"] = "1"
     @timeit PROJMPO_TIMER "ProjMPO.contract" begin
       for it in itensor_map
           idx += 1
           _step_hint = (_hint_lastonly && idx != _last_real_idx) ? nothing : v_dense_hint
-          # Step context for permute-profile probes (read by SparseBackends kernel too)
-          ENV["SB_STEP"] = string(idx)
+          # Step context for permute-profile probes (read by SparseBackends kernel
+          # too). DEBUGGING VAR — plain runtime Ref, not an ENV var.
+          SparseBackends.CURRENT_STEP[] = idx
           if do_trace && !(it isa OneITensor)
             _it_storage = ITensors.has_external_storage(it) ?
                           string(typeof(ITensors.get_external_storage(it))) : "dense"
@@ -591,32 +541,7 @@ function ITensors.contract(P::AbstractProjMPO, v::ITensor)::ITensor
               # steps are counted inside contract_aliased_dense_to_dense! instead, so
               # gating on !it_wrap avoids double-counting.
               if SparseBackends._flop_count_enabled() && !it_wrap
-                  SparseBackends.add_dense_macs!(_union_dim_macs(it, Hv))
-              end
-              if get(ENV, "SB_HAMPSI_DIAG", "0") == "1"
-                  _cls(t) = begin
-                      if ITensors.has_external_storage(t)
-                          st = ITensors.get_external_storage(t)
-                          st isa SparseBackends.WrappedAliasedBlockSparse ? "ALI(P=$(SparseBackends._abs_head_len(st)))" :
-                          st isa SparseBackends.WrappedBlockSparse ? "BS" : "wrapDense"
-                      else "dense" end
-                  end
-                  _ii(t) = [(ITensors.dim(I), string(ITensors.tags(I)), ITensors.plev(I)) for I in inds(t)]
-                  println("[HAMPSI_DIAG step idx=", idx, " pos=", position, "]")
-                  println("   it  ", _cls(it),  "  inds=", _ii(it))
-                  println("   Hv  ", _cls(Hv),  "  inds=", _ii(Hv))
-                  println("   shared=", [(ITensors.dim(I), string(ITensors.tags(I)), ITensors.plev(I)) for I in ITensors.commoninds(it, Hv)])
-                  if !isempty(_v_channel_ids) && _is_aliased_itensor(Hv)
-                      _dset = SparseBackends.dense_inds(ITensors.get_external_storage(Hv))
-                      _flipped = [I for I in _dset if ITensors.id(I) in _v_channel_ids]
-                      if !isempty(_flipped) && !_flip_flagged[]
-                          _flip_flagged[] = true
-                          println("   ⚠ [FLIP] φ-channel(s) now in Hv DENSE tail at step idx=", idx, ": ",
-                                  [(ITensors.dim(I), string(ITensors.tags(I)), ITensors.plev(I)) for I in _flipped],
-                                  "  ← this step (or its predecessor) moved a sparse channel to dense")
-                      end
-                  end
-                  flush(stdout)
+                  SparseBackends.add_dense_macs!(_union_dim_macs(it, Hv), false)
               end
               if it_wrap
                   if v_wrap
@@ -628,7 +553,8 @@ function ITensors.contract(P::AbstractProjMPO, v::ITensor)::ITensor
                       @timeit PROJMPO_TIMER "matvec.sparseH_wrapV_$(idx)" begin
                           Hv = preserve_bs_v ?
                               SparseBackends.contract_preserve_bs(Hv, it; template=nothing,
-                                  output_inds_hint=(_use_aa_hint ? _aa_step_hint(Hv, it) : _step_hint)) :
+                                  output_inds_hint=(_use_aa_hint ? _aa_step_hint(Hv, it) : _step_hint),
+                                  output_perm=SparseBackends.static_output_perm(_bondtype, idx)) :
                               Hv * it
                       end
                       if debug
@@ -636,16 +562,19 @@ function ITensors.contract(P::AbstractProjMPO, v::ITensor)::ITensor
                           println("inds(Hv) = ", inds(Hv))
                       end
                   else
-                      _sdd_path = get(ENV, "SB_SPARSEDENSE_DUMP", "")
-                      if !isempty(_sdd_path)
-                          _sdd_max = parse(Int, get(ENV, "SB_SPARSEDENSE_DUMP_MAX", "100"))
-                          if _SPARSEDENSE_DUMP_COUNT[] < _sdd_max
-                              open(_sdd_path, "a") do io
-                                  Serialization.serialize(io, (it = deepcopy(it), Hv = deepcopy(Hv)))
-                              end
-                              _SPARSEDENSE_DUMP_COUNT[] += 1
-                          end
-                      end
+                      # Was SB_SPARSEDENSE_DUMP(_MAX): serialize (it, Hv) ITensor pairs to a
+                      # path for offline replay. Commented out, not deleted — uncomment to
+                      # re-enable, giving `_sdd_path`/`_sdd_max` real values.
+                      # _sdd_path = get(ENV, "SB_SPARSEDENSE_DUMP", "")
+                      # if !isempty(_sdd_path)
+                      #     _sdd_max = parse(Int, get(ENV, "SB_SPARSEDENSE_DUMP_MAX", "100"))
+                      #     if _SPARSEDENSE_DUMP_COUNT[] < _sdd_max
+                      #         open(_sdd_path, "a") do io
+                      #             Serialization.serialize(io, (it = deepcopy(it), Hv = deepcopy(Hv)))
+                      #         end
+                      #         _SPARSEDENSE_DUMP_COUNT[] += 1
+                      #     end
+                      # end
                       if debug
                           println("Before multiplying sparse H and dense V at position ", position, " and index ", idx)
                           println("inds(it) = ", inds(it))
@@ -694,23 +623,18 @@ function ITensors.contract(P::AbstractProjMPO, v::ITensor)::ITensor
                               nothing
                           end
                           _rops = _capture ? _remaining_ops(idx) : nothing
+                          _Hv_prev = Hv    # consumed operand — recycle its dead buffer below
                           Hv = preserve_bs_v ?
                               SparseBackends.contract_preserve_bs(Hv, it; template=nothing,
                                   output_inds_hint=(_use_aa_hint ? _aa_step_hint(Hv, it) : _step_hint),
-                                  next_op=_it_next, remaining_ops=_rops) :
+                                  next_op=_it_next, remaining_ops=_rops,
+                                  output_perm=SparseBackends.static_output_perm(_bondtype, idx)) :
                               Hv * it
-                      end
-                      # SB_MATVEC_DIAG: budgeted per-step intermediate-size dump (both backends).
-                      if get(ENV, "SB_MATVEC_DIAG", "0") == "1"
-                          if _MV_DIAG_BUDGET[] < 0
-                              _MV_DIAG_BUDGET[] = parse(Int, get(ENV, "SB_MATVEC_DIAG_BUDGET", "20"))
-                          end
-                          if _MV_DIAG_BUDGET[] > 0 && ITensors.has_external_storage(Hv)
-                              nb, nt, bsz, le = SparseBackends.matvec_size_info(ITensors.get_external_storage(Hv))
-                              println("[MV_SIZE] step=", idx, " nblocks=", nb, " ntempl=", nt,
-                                      " blksize=", bsz, " logical_elems=", le,
-                                      " compression=", nt == 0 ? 0.0 : round(nb/nt, digits=2))
-                              _MV_DIAG_BUDGET[] -= 1
+                          # Recycle the consumed intermediate's dead template buffer into
+                          # the pending pool so the next step reuses its capacity. NEVER
+                          # the input v (KrylovKit owns it) → identity guard.
+                          if _recycle_intermediates && _Hv_prev !== v
+                              SparseBackends.recycle_aliased_pending!(_Hv_prev)
                           end
                       end
                       if debug
@@ -721,7 +645,7 @@ function ITensors.contract(P::AbstractProjMPO, v::ITensor)::ITensor
                       # DENSE_INDS_DEBUG=1: budgeted (idx, inds(it), inds(Hv), inds(Hv*it))
                       # dump so we can compare what natural-order ITensor produces
                       # for dense H·v contracts vs what the sparse hint kernel does.
-                      if get(ENV, "DENSE_INDS_DEBUG", "0") == "1" && _DENSE_INDS_BUDGET[] > 0
+                      if false && _DENSE_INDS_BUDGET[] > 0  # DENSE_INDS_DEBUG removed 2026-06 — flip to true here for debug output
                         _DENSE_INDS_BUDGET[] -= 1
                         _di_shared = ITensors.commoninds(it, Hv)
                         println("[DENSE_INDS] idx=$idx  shared=$(length(_di_shared))")
@@ -729,20 +653,20 @@ function ITensors.contract(P::AbstractProjMPO, v::ITensor)::ITensor
                         println("  inds(Hv) = ", [(ITensors.dim(I), ITensors.tags(I), ITensors.plev(I)) for I in inds(Hv)])
                         println("  shared   = ", [(ITensors.dim(I), ITensors.tags(I), ITensors.plev(I)) for I in _di_shared])
                       end
-                      # SB_DENSEDENSE_DUMP=<path>: serialize (it, Hv) ITensor
-                      # pairs to <path> for offline replay (test alternative
-                      # orderings under real ITensors *). Capped via
-                      # SB_DENSEDENSE_DUMP_MAX (default 100).
-                      _ddd_path = get(ENV, "SB_DENSEDENSE_DUMP", "")
-                      if !isempty(_ddd_path)
-                          _ddd_max = parse(Int, get(ENV, "SB_DENSEDENSE_DUMP_MAX", "100"))
-                          if _DENSEDENSE_DUMP_COUNT[] < _ddd_max
-                              open(_ddd_path, "a") do io
-                                  Serialization.serialize(io, (it = deepcopy(it), Hv = deepcopy(Hv)))
-                              end
-                              _DENSEDENSE_DUMP_COUNT[] += 1
-                          end
-                      end
+                      # Was SB_DENSEDENSE_DUMP(_MAX): serialize (it, Hv) ITensor pairs to a
+                      # path for offline replay (test alternative orderings under real
+                      # ITensors *). Commented out, not deleted — uncomment to re-enable,
+                      # giving `_ddd_path`/`_ddd_max` real values.
+                      # _ddd_path = get(ENV, "SB_DENSEDENSE_DUMP", "")
+                      # if !isempty(_ddd_path)
+                      #     _ddd_max = parse(Int, get(ENV, "SB_DENSEDENSE_DUMP_MAX", "100"))
+                      #     if _DENSEDENSE_DUMP_COUNT[] < _ddd_max
+                      #         open(_ddd_path, "a") do io
+                      #             Serialization.serialize(io, (it = deepcopy(it), Hv = deepcopy(Hv)))
+                      #         end
+                      #         _DENSEDENSE_DUMP_COUNT[] += 1
+                      #     end
+                      # end
                       _ppio = _permute_profile_io()
                       if _ppio !== nothing
                           _pp_inA = inds(it); _pp_inB = inds(Hv)
@@ -755,7 +679,7 @@ function ITensors.contract(P::AbstractProjMPO, v::ITensor)::ITensor
                               Hv = get(ENV, "SB_PLAN_B", "0") == "1" ? it * Hv : Hv * it
                           end
                           _pp_dt = (time_ns() - _pp_t0) / 1e9
-                          println(_ppio, permute_profile_site(), "\tdenseH\t",
+                          println(_ppio, permute_profile_site(run_label), "\tdenseH\t",
                                   length(_pp_inA), "\t", length(_pp_inB), "\t", ndims(Hv), "\t",
                                   length(_pp_shared), "\t",
                                   0.0, "\t", 0.0, "\t", 0.0, "\t", _pp_dt, "\t",
@@ -789,7 +713,6 @@ function ITensors.contract(P::AbstractProjMPO, v::ITensor)::ITensor
           end
       end
     end
-    ENV["SB_IN_MATVEC"] = "0"
     if debug
         println("------------------")
     end
@@ -807,7 +730,7 @@ function ITensors.contract(P::AbstractProjMPO, v::ITensor)::ITensor
             Hv = ITensors._itensor_from_external_storage(snapped)
         end
     end
-    if get(ENV, "SB_ALIASED_TRACE", "0") == "1" && _ALIASED_HV_TRACE_COUNT[] < 30
+    if SparseBackends.ALIASED_TRACE[] && _ALIASED_HV_TRACE_COUNT[] < 30
         _ALIASED_HV_TRACE_COUNT[] += 1
         v_st = ITensors.has_external_storage(v) ? typeof(v.tensor.data) : "dense"
         hv_st = ITensors.has_external_storage(Hv) ? typeof(Hv.tensor.data) : "dense"
@@ -958,8 +881,8 @@ returned ITensor will have the same indices
 as `v`. The operator overload `P(v)` is
 shorthand for `product(P,v)`.
 """
-function product(P::AbstractProjMPO, v::ITensor)::ITensor
-    Pv = contract(P, v)
+function product(P::AbstractProjMPO, v::ITensor; debug::Bool=false, roofline::Bool=false, run_label::String="?")::ITensor
+    Pv = contract(P, v; roofline=roofline, run_label=run_label)
     if order(Pv) != order(v)
         error(
             string(
@@ -973,8 +896,9 @@ function product(P::AbstractProjMPO, v::ITensor)::ITensor
         )
     end
     Pv = noprime(Pv)
-    if get(ENV, "SB_PHI_SCHEMA_DUMP", "0") == "1" &&
-       _PHI_SCHEMA_DUMP_COUNT[] < parse(Int, get(ENV, "SB_PHI_SCHEMA_DUMP_MAX", "1"))
+    # Was SB_PHI_SCHEMA_DUMP(_MAX); pass debug=true at a call site to enable
+    # (budget hardcoded to 1 call below, was SB_PHI_SCHEMA_DUMP_MAX).
+    if debug && _PHI_SCHEMA_DUMP_COUNT[] < 1
         _PHI_SCHEMA_DUMP_COUNT[] += 1
         println("\n========== [SB_PHI_SCHEMA_DUMP #", _PHI_SCHEMA_DUMP_COUNT[],
                 "] matvec input φ  vs  output Hv=Pφ ==========")
@@ -1042,7 +966,6 @@ function Base.size(P::AbstractProjMPO)::Tuple{Int, Int}
 end
 
 const _ENV_DBG_COUNT = Ref(0)
-const _H2_DBG = Ref(0)
 
 # Reorder an env tensor so that:
 #   - axes tagged "FusedSparse" go LAST  (matches the matvec kernel's
@@ -1103,13 +1026,12 @@ function _reorder_env_for_aliased(T::ITensor, both_aliased::Bool=false, aliased_
     return ITensors.permute(T, new_order...)
 end
 
-function _makeL!(P::AbstractProjMPO, psi::MPS, k::Int; debug=false)::Union{ITensor, Nothing}
-    # SB_ENV_DEBUG=1 turns on env structure prints for the first
-    # SB_ENV_DEBUG_MAX (default 6) env-build steps.  Shows the index order
-    # of L (and the substep results) so we can see what indices the
-    # downstream matvec contraction will see.
-    _env_dbg = get(ENV, "SB_ENV_DEBUG", "0") == "1"
-    _env_dbg_max = parse(Int, get(ENV, "SB_ENV_DEBUG_MAX", "6"))
+function _makeL!(P::AbstractProjMPO, psi::MPS, k::Int; debug=false, roofline::Bool=false, run_label::String="?")::Union{ITensor, Nothing}
+    # Was SB_ENV_DEBUG/_MAX — removed. Hardcoded off; the prints below (env
+    # structure / index order for L and its substeps) are unreachable dead
+    # code kept for reference. Flip _env_dbg to true to re-enable.
+    _env_dbg = false
+    _env_dbg_max = 6
     # println("\t\tPositioning ProjMPO ", debug)
     # Save the last `L` that is made to help with caching
     # for DiskProjMPO
@@ -1151,8 +1073,8 @@ function _makeL!(P::AbstractProjMPO, psi::MPS, k::Int; debug=false)::Union{ITens
             end
             # Keep the env aliased when BOTH ψ and H are aliased (both-aliased
             # run), so its multiplicity axes stay dense in the matvec output.
-            _keep_env = get(ENV, "SB_ALIASED_AA_ENV", "1") == "1" &&
-                _is_aliased_itensor(H_site) && _is_aliased_itensor(psi[ll + 1])
+            # Hardened 2026-06 — always on (was SB_ALIASED_AA_ENV, default-on knob).
+            _keep_env = _is_aliased_itensor(H_site) && _is_aliased_itensor(psi[ll + 1])
             L = _env_mul(L, H_site, _keep_env)
             if _env_dbg && _ENV_DBG_COUNT[] <= _env_dbg_max
                 println("  L (after × H_site) inds = ", inds(L))
@@ -1190,7 +1112,7 @@ function _makeL!(P::AbstractProjMPO, psi::MPS, k::Int; debug=false)::Union{ITens
             end
         end
         P.LR[ll + 1] = L
-        _record_env_footprint(ll + 1, L)
+        roofline && _record_env_footprint(ll + 1, L, run_label)
         ll += 1
     end
     # Needed when moving lproj backward.
@@ -1198,13 +1120,13 @@ function _makeL!(P::AbstractProjMPO, psi::MPS, k::Int; debug=false)::Union{ITens
     return L
 end
 
-function makeL!(P::AbstractProjMPO, psi::MPS, k::Int; debug=false)
+function makeL!(P::AbstractProjMPO, psi::MPS, k::Int; debug=false, roofline::Bool=false, run_label::String="?")
     # println("\tPositioning ProjMPO ", debug)
-    _makeL!(P, psi, k; debug=debug)
+    _makeL!(P, psi, k; debug=debug, roofline=roofline, run_label=run_label)
     return P
 end
 
-function _makeR!(P::AbstractProjMPO, psi::MPS, k::Int; debug=false)::Union{ITensor, Nothing}
+function _makeR!(P::AbstractProjMPO, psi::MPS, k::Int; debug=false, roofline::Bool=false, run_label::String="?")::Union{ITensor, Nothing}
     # Save the last `R` that is made to help with caching
     # for DiskProjMPO
     rl = P.rpos
@@ -1235,8 +1157,10 @@ function _makeR!(P::AbstractProjMPO, psi::MPS, k::Int; debug=false)::Union{ITens
             end
             println("========= ", " after multiplying dag psi: ", R)
         else
-            _env_dbg2 = get(ENV, "SB_ENV_DEBUG", "0") == "1"
-            _env_dbg2_max = parse(Int, get(ENV, "SB_ENV_DEBUG_MAX", "6"))
+            # Was SB_ENV_DEBUG/_MAX — removed. Hardcoded off; the prints below
+            # are unreachable dead code kept for reference.
+            _env_dbg2 = false
+            _env_dbg2_max = 6
             H_site = P.H[rl - 1]
             # if ITensors.has_external_storage(H_site)
             #     H_site = SparseBackends.to_dense_itensors(H_site)
@@ -1253,8 +1177,8 @@ function _makeR!(P::AbstractProjMPO, psi::MPS, k::Int; debug=false)::Union{ITens
                 println("  H_site inds       = ", inds(H_site),
                         "  external? ", ITensors.has_external_storage(H_site))
             end
-            _keep_env = get(ENV, "SB_ALIASED_AA_ENV", "1") == "1" &&
-                _is_aliased_itensor(H_site) && _is_aliased_itensor(psi[rl - 1])
+            # Hardened 2026-06 — always on (was SB_ALIASED_AA_ENV, default-on knob).
+            _keep_env = _is_aliased_itensor(H_site) && _is_aliased_itensor(psi[rl - 1])
             R = _env_mul(R, H_site, _keep_env)
             if _env_dbg2 && _ENV_DBG_COUNT[] <= _env_dbg2_max
                 println("  R (after × H_site) inds = ", inds(R))
@@ -1267,7 +1191,7 @@ function _makeR!(P::AbstractProjMPO, psi::MPS, k::Int; debug=false)::Union{ITens
             end
         end
         P.LR[rl - 1] = R
-        _record_env_footprint(rl - 1, R)
+        roofline && _record_env_footprint(rl - 1, R, run_label)
         # println(" check rl - 1 information ", rl - 1)
         # println("TENSOR IS ", R)
         rl -= 1
@@ -1276,8 +1200,8 @@ function _makeR!(P::AbstractProjMPO, psi::MPS, k::Int; debug=false)::Union{ITens
     return R
 end
 
-function makeR!(P::AbstractProjMPO, psi::MPS, k::Int; debug=false)
-    _makeR!(P, psi, k; debug=debug)
+function makeR!(P::AbstractProjMPO, psi::MPS, k::Int; debug=false, roofline::Bool=false, run_label::String="?")
+    _makeR!(P, psi, k; debug=debug, roofline=roofline, run_label=run_label)
     return P
 end
 
@@ -1293,10 +1217,10 @@ The MPS `psi` must have compatible bond indices with
 the previous projected MPO tensors for this
 operation to succeed.
 """
-function position!(P::AbstractProjMPO, psi::MPS, pos::Int; debug=false)
+function position!(P::AbstractProjMPO, psi::MPS, pos::Int; debug=false, roofline::Bool=false, run_label::String="?")
     # println("Positioning ProjMPO ", debug)
-    makeL!(P, psi, pos - 1; debug=debug)
-    makeR!(P, psi, pos + nsite(P); debug=debug)
+    makeL!(P, psi, pos - 1; debug=debug, roofline=roofline, run_label=run_label)
+    makeR!(P, psi, pos + nsite(P); debug=debug, roofline=roofline, run_label=run_label)
     return P
 end
 

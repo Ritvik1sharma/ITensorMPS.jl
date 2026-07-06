@@ -1645,7 +1645,7 @@ function orthogonalize!(M::AbstractMPS, j::Int; maxdim = nothing, normalize = no
                 M[b] * M[b + 1]
             end
             if is_aliased_pair
-                get(ENV, "SB_ALIASED_TRACE", "0") == "1" &&
+                SparseBackends.ALIASED_TRACE[] &&
                     println("[SB_ALIASED_TRACE orthogonalize! LEFT b=$b] aliased branch FIRES")
                 # Aliased-aware decomposition: dense SVD + re-aliasify (Tier 1).
                 # Does NOT call the BS QR/SVD channel-aware kernel.
@@ -1657,7 +1657,7 @@ function orthogonalize!(M::AbstractMPS, j::Int; maxdim = nothing, normalize = no
                 )
                 SparseBackends.schema_dbg("orthoL b=$b: L (factorized)", L)
                 SparseBackends.schema_dbg("orthoL b=$b: R (factorized)", R)
-                if get(ENV, "SB_ALIASED_TRACE", "0") == "1"
+                if SparseBackends.ALIASED_TRACE[]
                     println("  L=", typeof(L.tensor.data), "  R=", typeof(R.tensor.data))
                 end
             else
@@ -1709,7 +1709,7 @@ function orthogonalize!(M::AbstractMPS, j::Int; maxdim = nothing, normalize = no
                 M[b] * M[b + 1]
             end
             if is_aliased_pair
-                get(ENV, "SB_ALIASED_TRACE", "0") == "1" &&
+                SparseBackends.ALIASED_TRACE[] &&
                     println("[SB_ALIASED_TRACE orthogonalize! RIGHT b=$b] aliased branch FIRES  phi storage=", ITensors.has_external_storage(phi) ? typeof(phi.tensor.data) : "dense")
                 L, R, _ = SparseBackends.itensor_aliased_factorize(
                     phi, M[b], M[b + 1];
@@ -1717,7 +1717,7 @@ function orthogonalize!(M::AbstractMPS, j::Int; maxdim = nothing, normalize = no
                     maxdim = something(maxdim, typemax(Int)),
                     mindim = 1, cutoff = 0.0,
                 )
-                if get(ENV, "SB_ALIASED_TRACE", "0") == "1"
+                if SparseBackends.ALIASED_TRACE[]
                     println("  RIGHT L=", typeof(L.tensor.data), "  R=", typeof(R.tensor.data))
                 end
             else
@@ -1733,7 +1733,7 @@ function orthogonalize!(M::AbstractMPS, j::Int; maxdim = nothing, normalize = no
             end
             M[b]     = L
             M[b + 1] = R
-            if get(ENV, "SB_ALIASED_TRACE", "0") == "1"
+            if SparseBackends.ALIASED_TRACE[]
                 println("  RIGHT post-assign  M[b]=", typeof(M[b].tensor.data),
                         "  M[b+1]=", typeof(M[b+1].tensor.data))
             end
