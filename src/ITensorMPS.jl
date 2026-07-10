@@ -13,6 +13,7 @@ include("abstractprojmpo/projmposum.jl")
 include("abstractprojmpo/projmps.jl")
 include("abstractprojmpo/projmpo_mps.jl")
 include("observer.jl")
+include("rayleigh_ritz_sweep.jl")   # RR (:rr) sweep-side adapter, split from dmrg.jl
 include("dmrg.jl")
 include("adapt.jl")
 include("opsum_to_mpo/matelem.jl")

@@ -30,8 +30,8 @@ function site_range(P::ProjMPO_MPS)
     return r
 end
 
-function product(P::ProjMPO_MPS, v::ITensor)::ITensor
-    Pv = product(P.PH, v)
+function product(P::ProjMPO_MPS, v::ITensor; debug::Bool=false, roofline::Bool=false, run_label::String="?")::ITensor
+    Pv = product(P.PH, v; debug=debug, roofline=roofline, run_label=run_label)
     for p in P.pm
         Pv += P.weight * product(p, v)
     end
@@ -50,8 +50,8 @@ end
 
 Base.size(P::ProjMPO_MPS) = size(P.H)
 
-function position!(P::ProjMPO_MPS, psi::MPS, pos::Int; debug::Bool=false)
-    position!(P.PH, psi, pos; debug=debug)
+function position!(P::ProjMPO_MPS, psi::MPS, pos::Int; debug::Bool=false, roofline::Bool=false, run_label::String="")
+    position!(P.PH, psi, pos; debug=debug, roofline=roofline, run_label=run_label)
     for p in P.pm
         position!(p, psi, pos)
     end

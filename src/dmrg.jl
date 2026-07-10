@@ -413,6 +413,21 @@ function dmrg(
   # both sectors; cf. eigen 1.2e-5). Set false for the eigendecomposition path (marginally
   # more accurate). Only affects aliased Path-B runs (dense/isometric ψ skip it). No env var.
   minv_from_p::Union{Nothing,Bool}=true,
+  # Gram source for the Path-B metric M. true (default): identity-channel slice of
+  # the H-environment (cheap — reuses the env DMRG already maintains — but assumes a
+  # traceless-operator H; valid for KL, WRONG for PXP-type H whose MPO carries
+  # non-traceless operators, verified). false: DIRECT ψ†ψ transfer (the literal
+  # metric, correct for ANY H, and aliased iff ψ is aliased). Only affects aliased
+  # Path-B runs (dense/isometric ψ never build a gram).
+  gram_from_h::Bool=true,
+  # RR diagnostic: run the RR eigsolve (H·v, M·v, subspace) DENSE, re-aliasifying
+  # only at φ recovery. Tests whether the per-iteration aliasing is what caps the
+  # RR energy (the plateau) vs an inherent RR-accuracy/frozen-schema limit.
+  rr_dense_iter::Bool=false,
+  # B_op M^{-1/2} pseudo-inverse cutoff (drop eigenvalues < minv_rtol·maxλ) for the
+  # dense/eigen frame. nothing → default 0.1. Scan it to test whether PXP's graded
+  # metric M has ANY cutoff that converges (only affects :bop_* eigen path).
+  minv_rtol::Union{Nothing,Real}=nothing,
   debug=false,
   # Consolidates the old SB_ROOFLINE / SB_FLOP_COUNT / SB_ENV_FOOTPRINT /
   # SB_PERM_CAPTURE / GEMM_DIMS_HIST env vars (+ SB_PERMUTE_PROFILE's
@@ -428,8 +443,8 @@ function dmrg(
   # named run ("DENSE"/"ALIASED"/etc.) produced them. No correctness effect.
   run_label::String="?"
 )
-  run_mode in (:iso, :bop_aliased, :bop_densify, :minner) ||
-    error("dmrg: unknown run_mode=$(run_mode); expected one of :iso, :bop_aliased, :bop_densify, :minner")
+  run_mode in (:iso, :bop_aliased, :bop_densify, :minner, :rr) ||
+    error("dmrg: unknown run_mode=$(run_mode); expected one of :iso, :bop_aliased, :bop_densify, :minner, :rr")
   # Was SB_ALIASED_TRACE — thread this call's debug flag into SparseBackends'
   # trace Ref (not an ENV var), consulted by trace prints throughout the
   # aliased pipeline. Each print site's own fire-count budget is a hardcoded
@@ -489,12 +504,15 @@ function dmrg(
   opt_time = 0.0
   only_idx = 1
 
-  # Path-B gram-env cache: incremental L[i], R[i] for sparse psi.
-  # Built once here, then updated per replacebond! step (one contraction
-  # instead of O(N) rebuild). When psi is dense, gram_cache stays `nothing`
-  # and the dense path is unaffected.
-  gram_cache = SparseBackends.is_sparse_mps(psi) ?
-               SparseBackends.init_gram_cache(psi) :
+  # Path-B gram: the gram env is the identity-string channel of the H-env that
+  # position!/makeL!/makeR! already build, so we no longer run a separate ψ†ψ
+  # transfer. Precompute H's identity co-vectors ONCE (a property of the MPO,
+  # fixed all run); per bond the gram is one cheap slice of lproj/rproj (below).
+  # Dense psi: stays `nothing`, dense path unaffected.
+  # Only needed for the covector (gram_from_h=true) path. Skipping it when
+  # gram_from_h=false also sidesteps `PH.H` (ProjMPO_MPS stores H at PH.PH.H).
+  gram_covec = (gram_from_h && SparseBackends.is_sparse_mps(psi)) ?
+               SparseBackends.build_covector_cache(PH.H) :
                nothing
 
   for sw in 1:nsweep(sweeps)
@@ -550,7 +568,10 @@ function dmrg(
           # identity every Krylov iteration. The first operator is lproj (Lenv) in
           # the bulk/right-edge chain, or rproj (Renv) at the left edge where the
           # chain reverses. Layout-only — contraction math unchanged.
-          if SparseBackends.is_sparse_mps(psi) && run_mode !== :iso
+          if SparseBackends.is_sparse_mps(psi) && run_mode !== :iso && isa(PH, ProjMPO)
+            # (ProjMPO only — ProjMPO_MPS, the excited-state projector, has no lproj/PH.H
+            # accessors; this block is a LAYOUT-only permA optimization, so skipping it
+            # for excited runs is correctness-neutral, just a small per-bond permute.)
             # φ (eigensolver seed + recast template) reordered ONCE per bond by the
             # matvec-chain reduction rank, so step-1's permA is the identity every
             # Krylov iteration. φ's raw `psi[b]*psi[b+1]` shape is bond-specific (so
@@ -645,12 +666,39 @@ function dmrg(
                 # vectors than standard Lanczos because the M-inner-product
                 # frame is spectrally harder (M may be near-singular).
                 @timeit PROJMPO_TIMER "dmrg.gram_envs" begin
-                  Lgram = SparseBackends.get_left_gram(gram_cache, b)
-                  Rgram = SparseBackends.get_right_gram(gram_cache, b)
+                  # Gram = identity-channel slice of the H-env (PH positioned at b).
+                  # Lgram(b)=lproj·eL[b], Rgram(b)=rproj·eR[b+2]; OneITensor at an
+                  # edge (no sites that side) ⇒ trivial scalar gram, as before.
+                  if gram_from_h
+                    _lp = lproj(PH); _rp = rproj(PH)
+                    Lgram = _lp isa OneITensor ? ITensor(1.0) : _lp * gram_covec.eL[b]
+                    Rgram = _rp isa OneITensor ? ITensor(1.0) : _rp * gram_covec.eR[b + 2]
+                  else
+                    # DIRECT ψ†ψ transfer — the literal metric, no identity-channel
+                    # selector (which is wrong for non-traceless-operator H like PXP).
+                    # Aliased iff ψ is aliased (preserve_bs_output). Same site ranges as
+                    # the covector path: Lgram over 1..b-1, Rgram over b+2..N (two-site
+                    # local block b,b+1). Folded from the boundary inward so each step
+                    # collapses to a 2-link gram (bounded template count). Fresh per
+                    # bond (O(N²)/sweep) — correctness-first; incrementalize later.
+                    _dgram = function(from, to)
+                      T = *(psi[from], SparseBackends._dag_link_primed(psi[from]); preserve_bs_output=true)
+                      i = from; step = from <= to ? 1 : -1
+                      while i != to
+                        i += step
+                        T = *(T, psi[i]; preserve_bs_output=true)
+                        T = *(T, SparseBackends._dag_link_primed(psi[i]); preserve_bs_output=true)
+                      end
+                      return T
+                    end
+                    _Ndg = length(psi)
+                    Lgram = (b - 1 >= 1)    ? _dgram(1, b - 1)     : ITensors.ITensor(1.0)
+                    Rgram = (b + 2 <= _Ndg) ? _dgram(_Ndg, b + 2)  : ITensors.ITensor(1.0)
+                  end
                   SparseBackends.schema_dbg("GRAM Lgram b=$b", Lgram)
                   SparseBackends.schema_dbg("GRAM Rgram b=$b", Rgram)
-                  # Gram-structure diagnostic (eigenvalues, rank, separability, block-diagonality; proved M=c·Π). Manually enable: change `if false` → `if true`.
-                  if false
+                  # Gram-structure diagnostic (eigenvalues, rank, separability, block-diagonality; proved M=c·Π). Enable: SB_GRAM_DUMP=1.
+                  if get(ENV, "SB_GRAM_DUMP", "0") == "1"
                     _gdump = function(lbl, G)
                       gi = collect(ITensors.inds(G))
                       if isempty(gi); println("[GRAM_DUMP ", lbl, "] scalar/empty"); flush(stdout); return; end
@@ -742,16 +790,21 @@ function dmrg(
                   # NOTE: c is an ON-SHELL count (P acting on the constrained ground state's Z2
                   # sector) — NOT obtainable by contracting P's tensors (a raw P†P contraction is
                   # off-shell and picks up the physical dim 3, not the Z2 factor 2; verified).
-                  _p_c = if minv_from_p === true
-                    _N = length(psi)
-                    (2.0^cld(b - 1, 2), 2.0^cld(_N - b - 1, 2))
+                  Mhalf_L, Linv_L, Mhalf_R, Linv_R = if run_mode === :rr
+                    # RR applies the RAW Lgram/Rgram directly (no M^{±1/2}); skip the
+                    # (otherwise wasted) factor build so the RR timing is fair.
+                    (nothing, nothing, nothing, nothing)
                   else
-                    nothing
-                  end
-                  Mhalf_L, Linv_L, Mhalf_R, Linv_R =
+                    _p_c = if minv_from_p === true
+                      _N = length(psi)
+                      (2.0^cld(b - 1, 2), 2.0^cld(_N - b - 1, 2))
+                    else
+                      nothing
+                    end
                     SparseBackends.build_minv_half_pair_factored(Lgram, Rgram; phi_template=phi,
                                                                  both_aliased=_minv_both_aliased,
-                                                                 p_c=_p_c)
+                                                                 p_c=_p_c, minv_rtol=minv_rtol)
+                  end
                   # NOTE (2026-07): a SCALAR M^{±1/2} on aligned operands (seed √c·φ, recovery
                   # (1/√c)·y, since contract(M_L,φ)=c_L·φ for P-built φ) was tested and REVERTED —
                   # it converged ~10× further from the dense-PHP ground truth than this full-G
@@ -777,34 +830,13 @@ function dmrg(
                           SparseBackends.recast_bs_to_template(Cw, Tw))
                     elseif Cw isa SparseBackends.WrappedAliasedBlockSparse &&
                            Tw isa SparseBackends.WrappedAliasedBlockSparse
-                      # SB_SNAP_PHI=1 (experiment): snap the matvec output to φ's exact
-                      # 36-key/dedup schema — DROPS the M^½-inflation keys (out∉φ) and
-                      # restores dedup, instead of the permute-only recast. Tests whether
-                      # those full-norm-but-factorize-discarded keys affect the eigenvalue.
-                      out = if get(ENV, "SB_SNAP_PHI", "0") == "1"
-                          # recast first (permute to φ axis order), THEN snap (filter to φ keys)
-                          _rc = SparseBackends.recast_aliased_to_template(Cw, Tw)
-                          ITensors._itensor_from_external_storage(
-                              _rc isa SparseBackends.WrappedAliasedBlockSparse ?
-                                  SparseBackends._snap_to_schema(_rc, Tw) : _rc)
-                      elseif get(ENV, "SB_DROP_KRYLOV", "0") == "1"
-                          # DISCRIMINATOR: drop the same out-of-φ keys as SNAP, but keep the
-                          # matvec output's OWN dedup (templates unchanged) → the downstream
-                          # add!! stays on the in-place path. If this is exact at md40 while
-                          # SNAP (dedup-restoring) drifted 1.7e-3, the drift was the merge-add
-                          # path, not an M^½-frame matrix-element loss → matvec pruning is safe.
-                          _rc = SparseBackends.recast_aliased_to_template(Cw, Tw)
-                          if _rc isa SparseBackends.WrappedAliasedBlockSparse
-                              _allowed = Set(Tw.aliased.keys)
-                              ITensors._itensor_from_external_storage(
-                                  SparseBackends.filter_keys_keepdedup(_rc, _allowed))
-                          else
-                              ITensors._itensor_from_external_storage(_rc)
-                          end
-                      else
-                          ITensors._itensor_from_external_storage(
-                              SparseBackends.recast_aliased_to_template(Cw, Tw))
-                      end
+                      # Permute the matvec output to φ's axis order (schema-preserving;
+                      # keeps its own keys/dedup). NOT a snap-to-φ's-key-set: that
+                      # (the removed SB_SNAP_PHI/SB_DROP_KRYLOV experiments) drops the
+                      # M^½-inflation keys and drifted the energy ~1.7e-3 — the
+                      # inflated keys carry real weight in the M^½ frame.
+                      out = ITensors._itensor_from_external_storage(
+                                SparseBackends.align_aliased_axes(Cw, Tw))
                       if _recast_dedup_chk_on &&
                          _recast_chk[] < 8 &&
                          ITensors.has_external_storage(out)
@@ -989,37 +1021,9 @@ function dmrg(
                       # solve), densified for :bop_densify (dense BLAS local solve).
                       y0 = @timeit PROJMPO_TIMER "dmrg.seed_Mhalf" apply_half(Mhalf_L, Mhalf_R, phi)
                       # _keytrace("2.y0 = M^{1/2}*phi (seed, raw)", y0)  # disabled — uncomment to re-enable
-                      if get(ENV, "SB_SNAP_PHI", "0") == "1" &&
-                         ITensors.has_external_storage(y0) && ITensors.has_external_storage(phi)
-                        _y0w = ITensors.get_external_storage(y0); _pw = ITensors.get_external_storage(phi)
-                        if _y0w isa SparseBackends.WrappedAliasedBlockSparse &&
-                           _pw isa SparseBackends.WrappedAliasedBlockSparse
-                          y0 = ITensors._itensor_from_external_storage(SparseBackends._snap_to_schema(_y0w, _pw))
-                        end
-                      end
-                      # SB_DROP_KRYLOV: filter the SEED to φ's key set too (dedup-1 kept),
-                      # so v₀ and every matvec output w share the SAME 36-key set → the
-                      # orthogonalization w−α·v₀ can't reintroduce dropped keys. Without
-                      # this the seed stays 72-key and −α·v₀ merges the dropped keys back.
-                      if get(ENV, "SB_DROP_KRYLOV", "0") == "1" &&
-                         ITensors.has_external_storage(y0) && ITensors.has_external_storage(phi)
-                        _y0w = ITensors.get_external_storage(y0); _pw = ITensors.get_external_storage(phi)
-                        if _y0w isa SparseBackends.WrappedAliasedBlockSparse &&
-                           _pw isa SparseBackends.WrappedAliasedBlockSparse
-                          if false   # was SB_DROP_KRYLOV_DBG — flip to true here for debug output
-                            _seedset = Set(_pw.aliased.keys)
-                            _seed_out = count(k -> !(k in _seedset), _y0w.aliased.keys)
-                            println("[SEED_DBG b=", b, " ha=", ha, " sw=", sw,
-                                    "] y0=M^{1/2}phi nb=", length(_y0w.aliased.keys),
-                                    " nt=", _y0w.aliased.n_templates,
-                                    " | phi nb=", length(_pw.aliased.keys),
-                                    " nt=", _pw.aliased.n_templates,
-                                    " | y0 keys NOT in phi=", _seed_out); flush(stdout)
-                          end
-                          y0 = ITensors._itensor_from_external_storage(
-                                   SparseBackends.filter_keys_keepdedup(_y0w, Set(_pw.aliased.keys)))
-                        end
-                      end
+                      # (Removed SB_SNAP_PHI / SB_DROP_KRYLOV seed experiments: snapping/
+                      # filtering the seed to φ's key-set drifted the energy ~1.7e-3 — the
+                      # M^½-inflation keys carry real weight. Seed stays the raw M^{1/2}φ.)
                       if _kdbg; SparseBackends.schema_dbg("y0 = M^{1/2}*phi b=$b", y0); end
                       _densify_solve && (y0 = SparseBackends.to_dense_itensors_unfused(y0))
                       vals, yvecs = eigsolve(
@@ -1088,9 +1092,10 @@ function dmrg(
                   # dedup-4 compression on the stored tensor and shrinking the factorize input.
                   # NOT an env-gated experiment: this is the schema-preserving contract of the
                   # aliased Path-B (the stored ψ must live in φ's schema). It is a no-op on
-                  # non-aliased φ (structural guard below). Distinct from SB_SNAP_PHI, which
-                  # filtered EVERY Krylov vector and drifted 1.7e-3 (the keys carry real weight
-                  # DURING the iteration; only the final stored vector is free to snap).
+                  # non-aliased φ (structural guard below). Distinct from the removed
+                  # SB_SNAP_PHI experiment, which snapped EVERY Krylov vector and drifted
+                  # 1.7e-3 (the inflation keys carry real weight DURING the iteration; only
+                  # the final stored vector is free to snap to φ's schema).
                   # SB_DROP_AT_FACT_DBG=1 prints per-bond key counts.
                   if !isempty(vecs) &&
                      ITensors.has_external_storage(vecs[1]) && ITensors.has_external_storage(phi)
@@ -1098,7 +1103,7 @@ function dmrg(
                     _pw0 = ITensors.get_external_storage(phi)
                     if _vw0 isa SparseBackends.WrappedAliasedBlockSparse &&
                        _pw0 isa SparseBackends.WrappedAliasedBlockSparse
-                      _rc0 = SparseBackends.recast_aliased_to_template(_vw0, _pw0)
+                      _rc0 = SparseBackends.align_aliased_axes(_vw0, _pw0)
                       if _rc0 isa SparseBackends.WrappedAliasedBlockSparse
                         if false  # SB_DROP_AT_FACT_DBG removed 2026-06 — flip to true here for debug output
                           println("[DROP_AT_FACT b=", b, " ha=", ha, " sw=", sw,
@@ -1119,15 +1124,31 @@ function dmrg(
                             "  Mrank-ok? Linv built; <phi|phi>=", round(real(inner(phi, phi)); digits=6))
                     flush(stdout)
                   end
+                elseif run_mode === :rr
+                  # Rayleigh–Ritz local eigensolve. Kernel: SparseBackends/src/
+                  # rayleigh_ritz.jl; sweep-side adapter (H·v operator build, dense-iter
+                  # diagnostic, aliased-φ recovery): ITensorMPS/src/rayleigh_ritz_sweep.jl.
+                  vals, vecs = rr_local_eigsolve(PH, phi, Lgram, Rgram, recast_to_phi;
+                      rr_dense_iter=rr_dense_iter,
+                      which=eigsolve_which_eigenvalue, tol=eigsolve_tol,
+                      krylovdim=eigsolve_krylovdim, maxiter=eigsolve_maxiter,
+                      roofline=roofline, run_label=run_label, b=b, ha=ha, sw=sw, debug=debug)
                 else  # run_mode === :minner
                 # Path B (M-inner-product Lanczos): redefine the Krylov inner
                 # product to <x,y>_M = <x, M·y>.
                 M_dot = (x, y) -> begin
-                    # M · y via factored: M = (Mhalf_L · Mhalf_L) · (Mhalf_R · Mhalf_R)
-                    My = SparseBackends.apply_minv_preserve_bs(Mhalf_L, y,  y)
-                    My = SparseBackends.apply_minv_preserve_bs(Mhalf_L, My, y)
-                    My = SparseBackends.apply_minv_preserve_bs(Mhalf_R, My, y)
-                    My = SparseBackends.apply_minv_preserve_bs(Mhalf_R, My, y)
+                    # M · y with the RAW gram (M = Lgram ⊗ Rgram) — one direct
+                    # contraction per side, NOT the eigen-factored Mhalf². Since
+                    # Mhalf_L² = Lgram only up to the rtol pseudo-inverse cut,
+                    # applying the raw Lgram/Rgram once each gives the UNTRUNCATED
+                    # metric (no rtol, no sqrt-then-square round-trip) and stays
+                    # aliased when the grams are aliased (gram_from_h=false, the
+                    # direct ψ†ψ transfer). NOTE: only the INNER PRODUCT is now
+                    # rtol-free; the A = M⁻¹·H operator below still applies Linv²
+                    # (= the rtol pseudo-inverse), which is intrinsic to this
+                    # formulation — see run_mode=:rr for the fully inverse-free path.
+                    My = SparseBackends.apply_minv_preserve_bs(Lgram, y,  y)
+                    My = SparseBackends.apply_minv_preserve_bs(Rgram, My, y)
                     return inner(x, My)
                 end
                 phi_wrapped = InnerProductVec(phi, M_dot)
@@ -1292,7 +1313,7 @@ function dmrg(
           #     _rw = SparseBackends.wrapped_contract_aliased(_aw, _bw; preserve_bs_output=true)
           #     _rw = _rw isa ITensors.ITensor ? ITensors.get_external_storage(_rw) : _rw
           #     if _rw isa SparseBackends.WrappedAliasedBlockSparse
-          #       _rw = SparseBackends.recast_aliased_to_template(_rw, _phiw)   # align axes to φ
+          #       _rw = SparseBackends.align_aliased_axes(_rw, _phiw)   # align axes to φ
           #       _rw = _rw isa ITensors.ITensor ? ITensors.get_external_storage(_rw) : _rw
           #     end
           #     _outkeys = (_rw isa SparseBackends.WrappedAliasedBlockSparse) ? Set(_rw.aliased.keys) : Set(eltype(_fk_in)[])
@@ -1312,18 +1333,9 @@ function dmrg(
 
           maxtruncerr = max(maxtruncerr, spec.truncerr)
 
-          # Path-B: update incremental gram-env cache after replacebond!.
-          # Forward sweep (ha=1, ortho="left"): psi[b] is now the new left-
-          # ortho tensor → L[b+1] must be refreshed.
-          # Backward sweep (ha=2, ortho="right"): psi[b+1] is the new right-
-          # ortho tensor → R[b+1] must be refreshed.
-          if gram_cache !== nothing
-            if ha == 1
-              SparseBackends.update_left!(gram_cache, psi, b)
-            else
-              SparseBackends.update_right!(gram_cache, psi, b + 1)
-            end
-          end
+          # Path-B: no gram-cache update needed — the gram is sliced fresh from
+          # the H-env each bond (Stage 1), and the H-env is maintained by
+          # position!/makeL!/makeR!. (Superseded update_left!/update_right!.)
 
           @debug_check begin
             checkflux(psi)
