@@ -37,13 +37,17 @@ function product(P::ProjMPS, v::ITensor)::ITensor
         error("Only two-site ProjMPS currently supported")
     end
 
+    # preserve_bs_output=true keeps the projection aliased when the ground state M
+    # (and the current ψ in its env) is aliased — a no-op for dense inputs. Without
+    # it these contractions densify, and the excited matvec Pv += weight·(…) then
+    # tries to add a dense term to the aliased H·v (no aliased+dense add method).
     Lpm = dag(prime(P.M[P.lpos + 1], "Link"))
-    !isnothing(lproj(P)) && (Lpm *= lproj(P))
+    !isnothing(lproj(P)) && (Lpm = *(Lpm, lproj(P); preserve_bs_output=true))
 
     Rpm = dag(prime(P.M[P.rpos - 1], "Link"))
-    !isnothing(rproj(P)) && (Rpm *= rproj(P))
+    !isnothing(rproj(P)) && (Rpm = *(Rpm, rproj(P); preserve_bs_output=true))
 
-    pm = Lpm * Rpm
+    pm = *(Lpm, Rpm; preserve_bs_output=true)
 
     pv = scalar(pm * v)
 
@@ -86,10 +90,11 @@ function makeL!(P::ProjMPS, psi::MPS, k::Int)
     while P.lpos < k
         ll = P.lpos
         if ll <= 0
-            P.LR[1] = psi[1] * dag(prime(P.M[1], "Link"))
+            P.LR[1] = *(psi[1], dag(prime(P.M[1], "Link")); preserve_bs_output=true)
             P.lpos = 1
         else
-            P.LR[ll + 1] = P.LR[ll] * psi[ll + 1] * dag(prime(P.M[ll + 1], "Link"))
+            P.LR[ll + 1] = *(*(P.LR[ll], psi[ll + 1]; preserve_bs_output=true),
+                             dag(prime(P.M[ll + 1], "Link")); preserve_bs_output=true)
             P.lpos += 1
         end
     end
@@ -101,10 +106,11 @@ function makeR!(P::ProjMPS, psi::MPS, k::Int)
     while P.rpos > k
         rl = P.rpos
         if rl >= N + 1
-            P.LR[N] = psi[N] * dag(prime(P.M[N], "Link"))
+            P.LR[N] = *(psi[N], dag(prime(P.M[N], "Link")); preserve_bs_output=true)
             P.rpos = N
         else
-            P.LR[rl - 1] = P.LR[rl] * psi[rl - 1] * dag(prime(P.M[rl - 1], "Link"))
+            P.LR[rl - 1] = *(*(P.LR[rl], psi[rl - 1]; preserve_bs_output=true),
+                             dag(prime(P.M[rl - 1], "Link")); preserve_bs_output=true)
             P.rpos -= 1
         end
     end

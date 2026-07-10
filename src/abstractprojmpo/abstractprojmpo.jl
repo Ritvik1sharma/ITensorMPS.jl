@@ -450,13 +450,26 @@ function ITensors.contract(P::AbstractProjMPO, v::ITensor; roofline::Bool=false,
     # TRACE_BOND / TRACE_LABEL removed 2026-06: one-shot full-step dump of a single
     # product(P, v) call at a chosen bond. Debug-print only. do_trace hardcoded
     # false below.
-    do_trace = false
+    # TRACE (manually re-enabled): fire ONCE, on the first bulk bond (neither
+    # env a OneITensor) whose chain contains an ALIASED operator — i.e. the H
+    # sites are aliased while Lenv/Renv stay dense (a MIXED chain, not fully
+    # aliased). This condition first becomes true in the aliased run's JIT
+    # WARMUP pass (maxdim hardcoded to 10 there), so the dumped bond dims reflect
+    # the warmup, not the requested --bd; the index STRUCTURE and permutes are
+    # identical to the measured run. Skips the dense-PHP run (no aliased op) and
+    # edge bonds. For --bd 10 the warmup maxdim == requested bd, so fully
+    # representative; for larger bd only the dim magnitudes would differ.
+    do_trace = (!_TRACE_BOND_FIRED[]) &&
+               !(lproj(P) isa OneITensor) && !(rproj(P) isa OneITensor) &&
+               any(t -> !(t isa OneITensor) && ITensors.has_external_storage(t) &&
+                        (ITensors.get_external_storage(t) isa SparseBackends.WrappedAliasedBlockSparse),
+                   itensor_map)
     if do_trace
       _TRACE_BOND_FIRED[] = true
       _show_inds(t) = [(ITensors.dim(I), string(ITensors.tags(I)), ITensors.plev(I)) for I in inds(t)]
       _v_storage = ITensors.has_external_storage(v) ?
                    string(typeof(ITensors.get_external_storage(v))) : "dense"
-      println("\n========== [TRACE_BOND=$trace_bond_target] product(P, v) ==========")
+      println("\n========== [TRACE first aliased bulk bond] product(P, v) ==========")
       println("v storage = $_v_storage")
       println("v.inds = ", _show_inds(v))
       SparseBackends.check_image("v (input = M^{1/2}φ)", v)
@@ -676,7 +689,7 @@ function ITensors.contract(P::AbstractProjMPO, v::ITensor; roofline::Bool=false,
                           _pp_t0 = time_ns()
                           
                           @timeit PROJMPO_TIMER "matvec.denseH_denseV_$(idx)" begin
-                              Hv = get(ENV, "SB_PLAN_B", "0") == "1" ? it * Hv : Hv * it
+                              Hv = Hv * it
                           end
                           _pp_dt = (time_ns() - _pp_t0) / 1e9
                           println(_ppio, permute_profile_site(run_label), "\tdenseH\t",
@@ -693,7 +706,7 @@ function ITensors.contract(P::AbstractProjMPO, v::ITensor; roofline::Bool=false,
                             println("inds(Hv) = ", inds(Hv))
                           end
                           @timeit PROJMPO_TIMER "matvec.denseH_denseV_$(idx)" begin
-                              Hv = get(ENV, "SB_PLAN_B", "0") == "1" ? it * Hv : Hv * it
+                              Hv = Hv * it
                           end
                           if debug
                                 println("After multiplying dense H and dense V at position ", position, " and index ", idx)
@@ -716,20 +729,10 @@ function ITensors.contract(P::AbstractProjMPO, v::ITensor; roofline::Bool=false,
     if debug
         println("------------------")
     end
-    # DIAGNOSTIC: snap-to-schema gated behind SB_ALIASED_SNAP=1 (default off
-    # while we debug correctness). When off, Lanczos uses cross-schema merge.
-    if get(ENV, "SB_ALIASED_SNAP", "0") == "1" &&
-       ITensors.has_external_storage(v) &&
-       v.tensor.data isa SparseBackends.WrappedAliasedBlockSparse &&
-       ITensors.has_external_storage(Hv) &&
-       Hv.tensor.data isa SparseBackends.WrappedAliasedBlockSparse
-        vw  = ITensors.get_external_storage(v)
-        hw  = ITensors.get_external_storage(Hv)
-        if vw.aliased.dims == hw.aliased.dims
-            snapped = SparseBackends._snap_to_schema(hw, vw)
-            Hv = ITensors._itensor_from_external_storage(snapped)
-        end
-    end
+    # (Removed the SB_ALIASED_SNAP matvec snap-to-schema experiment: recompressing
+    # each H·v output onto v's key-set here drifted the energy ~1.7e-3, same as the
+    # removed SB_SNAP_PHI. Lanczos uses the cross-schema merge; dedup is recovered
+    # at factorize. _snap_to_schema stays as a primitive — used by snap_dense_to_aliased.)
     if SparseBackends.ALIASED_TRACE[] && _ALIASED_HV_TRACE_COUNT[] < 30
         _ALIASED_HV_TRACE_COUNT[] += 1
         v_st = ITensors.has_external_storage(v) ? typeof(v.tensor.data) : "dense"
