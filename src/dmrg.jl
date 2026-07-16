@@ -586,6 +586,24 @@ function dmrg(
               phi = SparseBackends.reorder_aliased_by_rank(phi, _ops)
             end
           end
+          # Dense-ψ: pin φ to a canonical (link,site,site,link) order every bond so the
+          # matvec sees a stable input layout each Krylov iteration (replacebond!'s SVD
+          # otherwise emits φ in drifting orders → the step-output perm varies, defeating
+          # a static table). Layout-only (a permute of φ); psi/H storage untouched, E
+          # convergence-equivalent. Applies to GROUND (ProjMPO) AND EXCITED
+          # (ProjMPOSum): reorder_to_roles only touches φ (no PH accessors needed), and
+          # the excited H-term is a ProjMPO whose contract runs the same step-1 swap +
+          # env canonicalization, so pinning φ makes the strided read fire for excited too.
+          if !SparseBackends.is_sparse_mps(psi)
+            @timeit PROJMPO_TIMER "dmrg.phi_reorder_dense" begin
+              # Layout-C target (s2⁰ = role :s LAST): with L reordered so step 1
+              # emits T1 = [red(l1⁴¹) | F1 | keepB(l1³¹,s3⁰,l3⁰) | s2⁰], step-2's B
+              # arrives red-leading + keepB-contiguous → the kernel's strided-read
+              # (K2) fires and permute_B@2 is skipped. E is label-based, so this
+              # order change is convergence-equivalent.
+              phi = SparseBackends.reorder_to_roles(phi, [:l, :s2, :r, :s])
+            end
+          end
 
           SparseBackends.schema_dbg("eigsolve-OPERAND phi b=$b", phi)
 

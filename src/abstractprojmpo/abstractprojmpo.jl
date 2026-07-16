@@ -319,6 +319,18 @@ Mutates P.LR[idx] in place. Idempotent (skips if already canonical). Cost:
 O(|env|) once per `position!` boundary; amortized across all matvecs at
 that bond.
 """
+# True iff any H-MPO site of this projector is aliased (dense-ψ × aliased-H run).
+# Guarded: some projector types (e.g. excited-state wrappers) have no `.H`.
+function _proj_h_aliased(P::AbstractProjMPO)
+    hasproperty(P, :H) || return false
+    H = P.H
+    @inbounds for i in 1:length(H)
+        t = H[i]
+        !(t isa OneITensor) && ITensors.has_external_storage(t) && return true
+    end
+    return false
+end
+
 function _permute_env_to_canonical!(P::AbstractProjMPO, idx::Int)
     (idx <= 0 || idx > length(P.LR)) && return
     T = P.LR[idx]
@@ -329,6 +341,15 @@ function _permute_env_to_canonical!(P::AbstractProjMPO, idx::Int)
     fused     = [I for I in cur_inds if  is_fused(I)]
     non_fused = [I for I in cur_inds if !is_fused(I)]
     isempty(fused) && return
+    # dense-ψ × aliased-H: the matvec swaps step 1 to `env * φ` and needs the env as
+    # [ket, dense-H, fused, bra] (fused BEFORE bra) so T1 lands in "Layout C" and
+    # step 2 reads B strided (K2). Distinguished from the aliased-ψ × dense-H path
+    # (fused links come from ψ, H is dense) which keeps the original fused-LAST order.
+    if _proj_h_aliased(P) && !_is_aliased_itensor(T)
+        newT = _reorder_env_for_aliased(T, false, true)
+        (newT !== T) && (P.LR[idx] = newT)
+        return
+    end
     target = vcat(non_fused, fused)
     cur_inds == target && return
     P.LR[idx] = permute(T, target...)
@@ -489,6 +510,15 @@ function ITensors.contract(P::AbstractProjMPO, v::ITensor; roofline::Bool=false,
     # with the φ-template reorder in dmrg.jl `position!`).
     _first_real_idx = findfirst(x -> !(x isa OneITensor), itensor_map)
     _first_real_op  = _first_real_idx === nothing ? nothing : itensor_map[_first_real_idx]
+    # Step-1 operand swap (Plan B): the env is pre-ordered [ket, dense-H, fused,
+    # bra] by _reorder_env_for_aliased for the `env * φ` direction. Running step 1
+    # as `it * Hv` (env first) instead of `Hv * it` puts the env's dense-H leg
+    # (red_dense) LEADING and keepB contiguous in T1 = "Layout C", so step 2's
+    # aliased×dense kernel reads B strided (K2) with no permute_B. Only for an
+    # aliased-H run (dense-H baselines stay byte-identical); at edges where the
+    # geometry differs it just harmlessly falls back to permute_B. Label-based
+    # contraction ⇒ energy is convergence-equivalent.
+    _aliased_h_run = any(x -> !(x isa OneITensor) && ITensors.has_external_storage(x), itensor_map)
     # Bond-type for the static-perm table lookup (and the capture generator): the
     # only chain variation is the edge reversal — left edge (lproj scalar) vs right
     # edge (rproj scalar) vs bulk. Set in ENV for the wrapper to read.
@@ -511,6 +541,10 @@ function ITensors.contract(P::AbstractProjMPO, v::ITensor; roofline::Bool=false,
           # Step context for permute-profile probes (read by SparseBackends kernel
           # too). DEBUGGING VAR — plain runtime Ref, not an ENV var.
           SparseBackends.CURRENT_STEP[] = idx
+          # Canon-pool (dense-ψ × aliased-H): remember the operand THIS step consumes
+          # so its dead dense buffer can be returned to the ali_dense_alloc pool after
+          # the step. Only real steps; v and the produced Hv are guarded at recycle.
+          _prev_dense = (_aliased_h_run && !(it isa OneITensor)) ? Hv : nothing
           if do_trace && !(it isa OneITensor)
             _it_storage = ITensors.has_external_storage(it) ?
                           string(typeof(ITensors.get_external_storage(it))) : "dense"
@@ -594,13 +628,14 @@ function ITensors.contract(P::AbstractProjMPO, v::ITensor; roofline::Bool=false,
                           println("inds(Hv) = ", inds(Hv))
                       end
                       @timeit PROJMPO_TIMER "matvec.sparseH_denseV_$(idx)" begin
-                        # Plan B: put `it` on the left so output starts with
-                        # uncontr(it). Default behavior (off) keeps `Hv * it`.
-                        _it_next = (idx < length(itensor_map)) ? itensor_map[idx + 1] : nothing
+                        # Output order comes from the hardcoded dense-ψ table keyed by
+                        # (bondtype, step); φ is pinned upstream so this is deterministic
+                        # every sweep. Retires _canon_labels_for_next on the dense path
+                        # (next_op no longer passed).
                         Hv = SparseBackends.contract_aliased_itensor(
                             it, Hv, :aliased, :dense;
                             preserve_bs_output = false,
-                            next_op = _it_next,
+                            output_perm = SparseBackends.static_output_perm_dense(_bondtype, idx),
                         )
                       end
                       if debug
@@ -689,7 +724,8 @@ function ITensors.contract(P::AbstractProjMPO, v::ITensor; roofline::Bool=false,
                           _pp_t0 = time_ns()
                           
                           @timeit PROJMPO_TIMER "matvec.denseH_denseV_$(idx)" begin
-                              Hv = Hv * it
+                              Hv = (_aliased_h_run && idx == _first_real_idx) ?
+                                   _reorder_env_for_aliased(it, false, true) * Hv : Hv * it
                           end
                           _pp_dt = (time_ns() - _pp_t0) / 1e9
                           println(_ppio, permute_profile_site(run_label), "\tdenseH\t",
@@ -706,7 +742,12 @@ function ITensors.contract(P::AbstractProjMPO, v::ITensor; roofline::Bool=false,
                             println("inds(Hv) = ", inds(Hv))
                           end
                           @timeit PROJMPO_TIMER "matvec.denseH_denseV_$(idx)" begin
-                              Hv = Hv * it
+                              # Step 1 = env * φ (swapped) so T1 = "Layout C"
+                              # ([red | gapBefore | keepB(contig) | gapAfter]) and the
+                              # step-2 kernel reads B strided (no permute_B). The env is
+                              # canonicalized to [ket, dense-H, fused, bra] ONCE per bond
+                              # by _permute_env_to_canonical! (see below).
+                              Hv = (_aliased_h_run && idx == _first_real_idx) ? it * Hv : Hv * it
                           end
                           if debug
                                 println("After multiplying dense H and dense V at position ", position, " and index ", idx)
@@ -723,6 +764,12 @@ function ITensors.contract(P::AbstractProjMPO, v::ITensor; roofline::Bool=false,
             println("  Hv.inds (AFTER ) = ", _show_inds_after(Hv))
             println("  Hv storage after = $_hv_storage_after")
             SparseBackends.check_image("step $idx out", Hv)
+          end
+          # Recycle the consumed operand's dead dense buffer into the ali_dense_alloc
+          # pool. Guards: skip v (KrylovKit owns it) and skip the produced Hv (so the
+          # last step's output — the returned matvec result — is never pooled).
+          if _prev_dense !== nothing && _prev_dense !== Hv && _prev_dense !== v
+              SparseBackends.recycle_dense_ctgt!(_prev_dense)
           end
       end
     end
@@ -743,132 +790,6 @@ function ITensors.contract(P::AbstractProjMPO, v::ITensor; roofline::Bool=false,
 end
 const _ALIASED_HV_TRACE_COUNT = Ref(0)
 
-
-# function classify_H(Hs, n)
-#     if length(inds(Hs)) == 6
-#         tag = ""
-#         for i in inds(Hs)
-#             if i.has_tags("Link")
-#                 tag += "L,"
-#             else
-#                 tag += "s,"
-#             end
-#         end
-#         return "H[$n]: sparse (lL,lR,s,s',dL,dR)"
-#     elseif ndims(Hs) == 4
-#         tag = ""
-#         for i in inds(Hs)
-#             if i.has_tags("Link")
-#                 tag += "L,"
-#             else
-#                 tag += "s,"
-#             end
-#         end
-#         return "H[$n]: dense ($tag)"
-#     else
-#         return "H[$n]: unknown layout"
-#     end
-# end
-
-
-# function classify_H(Hs, n)
-
-#     idxs = inds(Hs)
-
-#     # collect label per index
-#     tags = String[]
-
-#     link_left = String[]
-#     link_right = String[]
-#     sites = String[]
-
-#     for (k, ix) in enumerate(idxs)
-
-#         ix_tags = string(ix)
-
-#         if has_tag(ix, "Link")
-#             # try to disambiguate left/right from tag string
-#             if occursin("left", ix_tags) || occursin("l=", ix_tags)
-#                 push!(tags, "L")
-#                 push!(link_left, "k$k")
-#             elseif occursin("right", ix_tags) || occursin("r=", ix_tags)
-#                 push!(tags, "R")
-#                 push!(link_right, "k$k")
-#             else
-#                 # unknown link → mark generic
-#                 push!(tags, "L?")
-#             end
-#         else
-#             push!(tags, "s")
-#             push!(sites, "k$k")
-#         end
-#     end
-
-#     tag_str = join(tags, ",")
-
-#     if length(idxs) == 6
-#         return "H[$n]: sparse (lL,lR,s,s',dL,dR) | $tag_str"
-#     elseif length(idxs) == 4
-#         return "H[$n]: dense (lL,lR,s,s') | $tag_str"
-#     else
-#         return "H[$n]: unknown layout ($tag_str)"
-#     end
-# end
-
-# function ITensors.contract(P::AbstractProjMPO, v::ITensor)::ITensor
-#     # Store (label, tensor)
-#     itensor_map = Vector{Tuple{String,Union{ITensor,OneITensor}}}()
-
-#     push!(itensor_map, ("LProj", lproj(P)))
-
-#     # DMRG Hamiltonian terms
-        
-#     # for (n, s) in enumerate(site_range(P))
-#     #     push!(itensor_map, (classify_H(P.H[s], n), P.H[s]))
-#     # end
-#     apppend!(itensor_map, [(classify_H(P.H[s], s), P.H[s]) for s in site_range(P)])
-
-#     push!(itensor_map, ("RProj", rproj(P)))
-
-#     # Reverse contraction order if needed
-#     first_t = first(itensor_map)[2]
-
-#     comp = if first_t isa OneITensor
-#         1
-#     elseif ITensors.has_external_storage(first_t)
-#         prod(SparseBackends._dims(ITensors.get_external_storage(first_t)))
-#     else
-#         dim(first_t)
-#     end
-
-#     if comp == 1
-#         reverse!(itensor_map)
-#     end
-
-#     Hv = v
-
-#     @timeit PROJMPO_TIMER "ProjMPO.contract" begin
-#         for (label, it) in itensor_map
-#             if it isa OneITensor
-#                 @timeit PROJMPO_TIMER "matvec.OneITensor" begin
-#                     Hv *= it
-#                 end
-
-#             elseif ITensors.has_external_storage(it)
-#                 @timeit PROJMPO_TIMER "matvec.sparse_$label" begin
-#                     Hv *= it
-#                 end
-
-#             else
-#                 @timeit PROJMPO_TIMER "matvec.dense_$label" begin
-#                     Hv *= it
-#                 end
-#             end
-#         end
-#     end
-
-#     return Hv
-# end
 
 """
     product(P::ProjMPO,v::ITensor)::ITensor
