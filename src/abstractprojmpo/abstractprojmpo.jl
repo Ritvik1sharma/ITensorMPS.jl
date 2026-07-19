@@ -397,30 +397,6 @@ function ITensors.contract(P::AbstractProjMPO, v::ITensor; roofline::Bool=false,
 
     # Apply the map
     Hv = v
-    # Decide ONCE whether to preserve BS output through this contract. If v
-    # entered as BS, route every step through contract_preserve_bs so the
-    # output stays BS (avoids dense fallthrough in the H × phi loop, which
-    # would later break KrylovKit's mixed-storage add!).
-    preserve_bs_v = ITensors.has_external_storage(v)
-    # When v is BS AND BMF_USE_HINT=1, derive an output classification hint
-    # from v's dense_inds. Gated because in-kernel hint support isn't done yet.
-    v_dense_hint = if preserve_bs_v
-      vw = ITensors.get_external_storage(v)
-      if vw isa SparseBackends.WrappedBlockSparse && false
-        # BS: UNSAFE, kept hardcoded off (was BMF_USE_HINT=1, default-off
-        # knob; in-kernel hint support was never finished — do not enable).
-        SparseBackends.dense_inds(vw)
-      elseif vw isa SparseBackends.WrappedAliasedBlockSparse
-        # Aliased: always pass v's dense_inds as hint so matvec output keeps
-        # v's classification. Aliased kernel honors via fission in
-        # _contract_aliased_prefix_outer_ad!.
-        SparseBackends.dense_inds(vw)
-      else
-        nothing
-      end
-    else
-      nothing
-    end
     index = 0
     position = site_range(P).start
     debug = false
@@ -429,43 +405,6 @@ function ITensors.contract(P::AbstractProjMPO, v::ITensor; roofline::Bool=false,
     end
     if false  # INDEX_DEBUG removed 2026-06 — flip to true here for debug output
         println("Contracting ProjMPO at position ", position, " ", debug, " ", DEBUG_FLAG)
-    end
-
-    # ── Both-aliased matvec hint (SB_ALIASED_AA_HINT, default on) ──────────────
-    # When BOTH ψ and the MPO H are aliased, the static per-step hint
-    # `dense_inds(v)` is wrong: it carries the ORIGINAL φ's Index ids, so (a) H's
-    # own dense multiplicity axes and (b) the EVOLVED intermediate Hv's dense axes
-    # — neither matching v's ids — get FISSIONED into the sparse prefix by
-    # output_inds, producing an intermediate whose multiplicity is prefix while a
-    # neighbouring aliased tensor keeps it dense → the aliased kernel's
-    # "C sparse prefix must equal A sparse prefix" / "crosses prefix/dense
-    # boundary" assertions. The env-builder `_mul_preserve_aliased` already avoids
-    # this by hinting the UNION of the CURRENT operands' dense_inds; do the same
-    # in the matvec. Strictly gated to runs with an aliased MPO H (so the
-    # only-φ-aliased `dense H`, only-H-aliased `dense ψ`, and BS pathways — incl.
-    # the test_aliased_psi aliased-ψ × dense-H benchmark — are byte-identical).
-    _v_is_aliased = ITensors.has_external_storage(v) &&
-        ITensors.get_external_storage(v) isa SparseBackends.WrappedAliasedBlockSparse
-    # Only worth checking H when ψ is aliased (cases 2 & 4). Avoids the P.H[range]
-    # slice allocation on every matvec of the all-dense / dense-ψ paths.
-    _H_is_aliased = _v_is_aliased && any(i -> _is_aliased_itensor(P.H[i]), site_range(P))
-    # Hardened 2026-06 — always on (was SB_ALIASED_AA_HINT, default-on knob).
-    _use_aa_hint = _v_is_aliased && _H_is_aliased
-    # Dense-H aliased-ψ ONLY: recycle each consumed matvec intermediate's template
-    # buffer back into the pending pool (see SparseBackends.recycle_aliased_pending!)
-    # so the next step reuses its capacity instead of allocating a fresh result-sized
-    # buffer. Guarded off for both-aliased / dense-ψ / BS ⇒ those paths byte-identical.
-    _recycle_intermediates = _v_is_aliased && !_H_is_aliased
-    # Union of the CURRENT operands' dense axes (only the aliased ones contribute).
-    @inline function _aa_step_hint(Hvc::ITensor, itc::ITensor)
-        s = Set{ITensors.Index}()
-        if _is_aliased_itensor(Hvc)
-            union!(s, SparseBackends.dense_inds(ITensors.get_external_storage(Hvc)))
-        end
-        if _is_aliased_itensor(itc)
-            union!(s, SparseBackends.dense_inds(ITensors.get_external_storage(itc)))
-        end
-        return s
     end
 
     # TRACE_BOND / TRACE_LABEL removed 2026-06: one-shot full-step dump of a single
@@ -496,20 +435,8 @@ function ITensors.contract(P::AbstractProjMPO, v::ITensor; roofline::Bool=false,
       SparseBackends.check_image("v (input = M^{1/2}φ)", v)
     end
 
-    # SB_ALIASED_HINT_LASTONLY: defer the s'-fission. Pass φ's dense_inds hint only
-    # on the LAST real contraction so intermediate matvec tensors keep s' (and other
-    # lifted indices) in the dense tail (big, BS-like GEMM blocks) instead of being
-    # fissioned into the sparse prefix at every step (tiny blocks). The final output
-    # still matches φ's {N2,P} schema for the downstream M⁻¹/factorize.
-    _hint_lastonly = true   # HARDENED (2026-06): defer s'-fission to the last matvec step → big-block intermediates (6.07→3.44 s/sweep, energy ~1e-12, aliasing preserved). No env toggle.
-    _last_real_idx  = findlast(x -> !(x isa OneITensor), itensor_map)
-    # WRAP-AROUND: the matvec is cyclic across Krylov iterations — this output
-    # becomes the next iteration's input φ, which is contracted FIRST with the
-    # chain's first operator. So canonicalising the LAST step's output for that
-    # first operator makes the NEXT matvec's step-1 permA the identity (paired
-    # with the φ-template reorder in dmrg.jl `position!`).
+    # First real (non-OneITensor) operator index — used by the step-1 env-swap below.
     _first_real_idx = findfirst(x -> !(x isa OneITensor), itensor_map)
-    _first_real_op  = _first_real_idx === nothing ? nothing : itensor_map[_first_real_idx]
     # Step-1 operand swap (Plan B): the env is pre-ordered [ket, dense-H, fused,
     # bra] by _reorder_env_for_aliased for the `env * φ` direction. Running step 1
     # as `it * Hv` (env first) instead of `Hv * it` puts the env's dense-H leg
@@ -525,19 +452,9 @@ function ITensors.contract(P::AbstractProjMPO, v::ITensor; roofline::Bool=false,
     _bondtype = (lproj(P) isa OneITensor) ? :left :
                 (rproj(P) isa OneITensor) ? :right : :bulk
     ENV["SB_BONDTYPE"] = string(_bondtype)
-    # GENERATOR (was SB_PERM_CAPTURE, now the roofline argument): the remaining
-    # real operators after step i, used by `_canon_by_rank` to derive the
-    # reduction-last order and print the per-(bond-type, step) permutation to
-    # bake into STATIC_OUTPUT_PERM. The LAST step wraps around to the first
-    # operator (its output becomes the next matvec's input φ). Off in
-    # production (table-only path); `nothing` ⇒ no operands piped to the live kernel.
-    _capture = roofline
-    _remaining_ops(i) = i == _last_real_idx ? Any[_first_real_op] :
-        Any[itensor_map[j] for j in (i+1):_last_real_idx if !(itensor_map[j] isa OneITensor)]
     @timeit PROJMPO_TIMER "ProjMPO.contract" begin
       for it in itensor_map
           idx += 1
-          _step_hint = (_hint_lastonly && idx != _last_real_idx) ? nothing : v_dense_hint
           # Step context for permute-profile probes (read by SparseBackends kernel
           # too). DEBUGGING VAR — plain runtime Ref, not an ENV var.
           SparseBackends.CURRENT_STEP[] = idx
@@ -591,24 +508,6 @@ function ITensors.contract(P::AbstractProjMPO, v::ITensor; roofline::Bool=false,
                   SparseBackends.add_dense_macs!(_union_dim_macs(it, Hv), false)
               end
               if it_wrap
-                  if v_wrap
-                      if debug
-                          println("Before multiplying sparse H and wrapped V at position ", position, " and index ", idx)
-                          println("inds(it) = ", inds(it))
-                          println("inds(Hv) = ", inds(Hv))
-                      end
-                      @timeit PROJMPO_TIMER "matvec.sparseH_wrapV_$(idx)" begin
-                          Hv = preserve_bs_v ?
-                              SparseBackends.contract_preserve_bs(Hv, it; template=nothing,
-                                  output_inds_hint=(_use_aa_hint ? _aa_step_hint(Hv, it) : _step_hint),
-                                  output_perm=SparseBackends.static_output_perm(_bondtype, idx)) :
-                              Hv * it
-                      end
-                      if debug
-                          println("After multiplying sparse H and wrapped V at position ", position, " and index ", idx)
-                          println("inds(Hv) = ", inds(Hv))
-                      end
-                  else
                       # Was SB_SPARSEDENSE_DUMP(_MAX): serialize (it, Hv) ITensor pairs to a
                       # path for offline replay. Commented out, not deleted — uncomment to
                       # re-enable, giving `_sdd_path`/`_sdd_max` real values.
@@ -642,54 +541,7 @@ function ITensors.contract(P::AbstractProjMPO, v::ITensor; roofline::Bool=false,
                           println("After multiplying sparse H and dense V at position ", position, " and index ", idx)
                           println("inds(Hv) = ", inds(Hv))
                       end
-                  end
               else
-                  if v_wrap
-                      if debug
-                          println("Before multiplying dense H and wrapped V at position ", position, " and index ", idx)
-                          println("inds(it) = ", inds(it))
-                          println("inds(Hv) = ", inds(Hv))
-                      end
-                      @timeit PROJMPO_TIMER "matvec.denseH_wrapV_$(idx)" begin
-                          # `it` (env) is dense, `Hv` is aliased. In a both-aliased run
-                          # the stale `dense_inds(v)` hint mis-labels the EVOLVED Hv's own
-                          # multiplicity axes (different ids than v) → over-fission. Use
-                          # the current operands' union hint (here = dense_inds(Hv)).
-                          # See _use_aa_hint above; untouched for dense-H / BS runs.
-                          # SB_ALIASED_ENABLE has been removed (2026-06), aliased kernel honors the
-                          # NEXT operator in the deterministic chain so the contract function emits THIS
-                          # step's output already in the A-canonical layout (axes the
-                          # next step contracts placed LAST), making the next step's
-                          # kernel permA (input-ψ reorg, the dominant data movement)
-                          # the identity. The index-order computation happens once,
-                          # inside the contract function (not here).
-                          _it_next = if idx < _last_real_idx && !(itensor_map[idx + 1] isa OneITensor)
-                              itensor_map[idx + 1]            # normal: next operator in the chain
-                          elseif idx == _last_real_idx
-                              _first_real_op                  # WRAP-AROUND: first operator of the next matvec
-                          else
-                              nothing
-                          end
-                          _rops = _capture ? _remaining_ops(idx) : nothing
-                          _Hv_prev = Hv    # consumed operand — recycle its dead buffer below
-                          Hv = preserve_bs_v ?
-                              SparseBackends.contract_preserve_bs(Hv, it; template=nothing,
-                                  output_inds_hint=(_use_aa_hint ? _aa_step_hint(Hv, it) : _step_hint),
-                                  next_op=_it_next, remaining_ops=_rops,
-                                  output_perm=SparseBackends.static_output_perm(_bondtype, idx)) :
-                              Hv * it
-                          # Recycle the consumed intermediate's dead template buffer into
-                          # the pending pool so the next step reuses its capacity. NEVER
-                          # the input v (KrylovKit owns it) → identity guard.
-                          if _recycle_intermediates && _Hv_prev !== v
-                              SparseBackends.recycle_aliased_pending!(_Hv_prev)
-                          end
-                      end
-                      if debug
-                          println("After multiplying dense H and wrapped V at position ", position, " and index ", idx)
-                          println("inds(Hv) = ", inds(Hv))
-                      end
-                  else
                       # DENSE_INDS_DEBUG=1: budgeted (idx, inds(it), inds(Hv), inds(Hv*it))
                       # dump so we can compare what natural-order ITensor produces
                       # for dense H·v contracts vs what the sparse hint kernel does.
@@ -754,7 +606,6 @@ function ITensors.contract(P::AbstractProjMPO, v::ITensor; roofline::Bool=false,
                                 println("inds(Hv) = ", inds(Hv))
                           end
                       end
-                  end
               end
           end
           if do_trace && !(it isa OneITensor)
