@@ -15,7 +15,6 @@ include("abstractprojmpo/projmpo_mps.jl")
 include("abstractprojmpo/core_projmpo.jl")   # factor-core matvec operator (+ CoreProjMPO)
 include("abstractprojmpo/fused_mpo_helpers_partial_matvec.jl")   # partial fused H1·H2 matvec (aliased HPHP, dense ψ)
 include("observer.jl")
-include("rayleigh_ritz_sweep.jl")   # RR (:rr) sweep-side adapter, split from dmrg.jl
 include("dmrg.jl")
 include("factor_core_dmrg.jl")      # core-mode DMRG (:core_php), separated from dmrg.jl
 include("adapt.jl")
