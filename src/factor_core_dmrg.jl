@@ -114,9 +114,11 @@ end
                   eigsolve_krylovdim=30, eigsolve_tol=1e-12, outputlevel=1)
         -> (energy, psi)
 
-Core-mode DMRG (factor-core, diagonal P). `psi0` is the aliased ψ = P·core. Optimizes
-the core with metric I (no M), keeping ψ aliased. Returns the physical ground energy
-and the optimized aliased ψ. Delegated to from `dmrg(...; run_mode=:core_php, P=P)`.
+Core-mode DMRG (factor-core; diagonal AND flip P). `psi0` is the aliased ψ = P·core.
+Optimizes the core with metric I (no M), keeping ψ aliased. Returns the physical ground
+energy and the optimized aliased ψ. This is the ONLY aliased-ψ + dense-H method (the
+Path-B run modes were removed); reachable via `dmrg(H, psi0; P=P, nsweeps, maxdim)` for
+an aliased ψ, or called directly.
 """
 function dmrg_core_php(H::MPO, P::MPO, psi0::MPS; nsweeps::Int, maxdim::Int, mindim::Int=1,
                        cutoff::Real=1e-12, eigsolve_krylovdim::Int=30,
