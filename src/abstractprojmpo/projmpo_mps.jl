@@ -50,8 +50,11 @@ end
 
 Base.size(P::ProjMPO_MPS) = size(P.H)
 
-function position!(P::ProjMPO_MPS, psi::MPS, pos::Int; debug::Bool=false, roofline::Bool=false, run_label::String="")
-    position!(P.PH, psi, pos; debug=debug, roofline=roofline, run_label=run_label)
+function position!(P::ProjMPO_MPS, psi::MPS, pos::Int; debug::Bool=false, roofline::Bool=false,
+                   run_label::String="", run_mode::Symbol=:standard)
+    # Forward run_mode to the H-term ProjMPO (which may fuse); the projector ProjMPS envs
+    # are plain MPS overlaps (not aliased) and stay stock.
+    position!(P.PH, psi, pos; debug=debug, roofline=roofline, run_label=run_label, run_mode=run_mode)
     for p in P.pm
         position!(p, psi, pos)
     end

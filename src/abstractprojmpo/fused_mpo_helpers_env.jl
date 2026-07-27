@@ -148,16 +148,96 @@ function _fused_sparse_env_contract(E::ITensor, H::ITensor, psi_site::ITensor,
 end
 
 # ============================================================
-# Thin direction-specific wrappers
+# Live-DMRG wiring: fused env stepping + position!, used by run_mode=:fused.
+#
+# INDEX-ORDER AUDIT (per-seam, for "no redundant re-permute"):
+#  • env → env (chained fused steps): the kernel reads E via
+#      array(permute(E, stat_dense_ind, Ebra, Eket, stat_ind))  [line ~54]
+#    and OUTPUTS  itensor(Enewarr, kNewp, kNew, new_dense_ind, new_ind)
+#    = (bra, ket, dense-mult, sparse-chan). The next step wants
+#    (dense, bra, ket, sparse), so it DOES permute E once. This permute is
+#    INTRINSIC to the kernel (it is present and measured in test_fused_real's
+#    profile_kernel as part of the FULL-kernel time) — the wiring adds none.
+#    ψ and ψ† are likewise permuted to (Eket,s,kNew)/(Ebra,s',kNew') once per
+#    step; template blocks are read in native stored order (never permuted, via
+#    the step-2 transpose flag). So per env step the ONLY data moves are the 3
+#    structural operand permutes + the 3 BLAS gemms — same set the stock
+#    _env_mul chain pays, minus the intermediate materializations.
+#  • env → matvec: build_partial_matvec_context re-derives the env legs by Index
+#    id and permutes lproj/rproj into Lenv_mat/Renv_mat ONCE per bond (v-independent,
+#    amortized over every Krylov matvec). So the fused env's stored order does not
+#    force any per-matvec permute regardless of what order it emits.
+#  ⇒ We deliberately do NOT append _reorder_env_for_aliased to the fused output:
+#    every consumer re-derives by id/role, and adding it would cost one extra
+#    permute on every bulk step for no correctness or matvec benefit. (Edge-bond
+#    stock `product` matvecs consume these envs by id too; without the canonical
+#    reorder they take their permute_B fallback — correct, and only on 2 bonds.)
 # ============================================================
-function fused_sparse_makeL!(P, psi, ll)
-    Enew = _fused_sparse_env_contract(P.LR[ll], P.H[ll+1], psi[ll+1], psi[ll])
-    P.LR[ll+1] = Enew
-    return Enew
+
+# Eligible for the fused kernel: the incoming env E is a real 4-leg tensor (NOT the
+# boundary OneITensor scalar) and the site H tensor is a 6-leg aliased bulk tensor.
+# Boundary steps and any non-aliased/dense H fall back to the stock _env_mul chain.
+_fused_env_eligible(E, H_site) =
+    (E isa ITensor) && _is_aliased_itensor(H_site) && length(inds(H_site)) == 6
+
+# One LEFT env step, LR[ll] → LR[ll+1] (mirrors _makeL!'s stock body; swaps the
+# aliased H·dag(ψ')·ψ chain for the fused kernel when eligible).
+function _fused_makeL!(P::ProjMPO, psi::MPS, k::Int; roofline::Bool=false, run_label::String="?")
+    ll = P.lpos
+    if ll ≥ k
+        P.lpos = k; return nothing
+    end
+    ll = max(ll, 0)
+    L = lproj(P)
+    while ll < k
+        H_site = P.H[ll + 1]
+        if _fused_env_eligible(L, H_site)
+            # E=LR[ll]=L, H[ll+1], psi_site=psi[ll+1], neighbor=psi[ll] (identifies psi's new bond)
+            L = _fused_sparse_env_contract(L, H_site, psi[ll + 1], psi[ll])
+        else
+            _keep = _is_aliased_itensor(H_site) && _is_aliased_itensor(psi[ll + 1])
+            L = _env_mul(L, H_site, _keep)
+            L = _env_mul(L, dag(prime(psi[ll + 1])), _keep)
+            L = _env_mul(L, psi[ll + 1], _keep)
+            L = _reorder_env_for_aliased(L, _keep, _is_aliased_itensor(H_site))
+        end
+        P.LR[ll + 1] = L
+        roofline && _record_env_footprint(ll + 1, L, run_label)
+        ll += 1
+    end
+    P.lpos = k
+    return L
 end
 
-function fused_sparse_makeR!(P, psi, ll)
-    Enew = _fused_sparse_env_contract(P.LR[ll], P.H[ll], psi[ll], psi[ll+1])
-    P.LR[ll-1] = Enew
-    return Enew
+# One RIGHT env step, LR[rl] → LR[rl-1] (mirrors _makeR!'s stock body).
+function _fused_makeR!(P::ProjMPO, psi::MPS, k::Int; roofline::Bool=false, run_label::String="?")
+    rl = P.rpos
+    if rl ≤ k
+        P.rpos = k; return nothing
+    end
+    N = length(P.H)
+    rl = min(rl, N + 1)
+    R = rproj(P)
+    while rl > k
+        H_site = P.H[rl - 1]
+        if _fused_env_eligible(R, H_site)
+            # E=LR[rl]=R, H[rl-1], psi_site=psi[rl-1], neighbor=psi[rl]
+            R = _fused_sparse_env_contract(R, H_site, psi[rl - 1], psi[rl])
+        else
+            _keep = _is_aliased_itensor(H_site) && _is_aliased_itensor(psi[rl - 1])
+            R = _env_mul(R, H_site, _keep)
+            R = _env_mul(dag(prime(psi[rl - 1])), R, _keep)
+            R = _env_mul(psi[rl - 1], R, _keep)
+            R = _reorder_env_for_aliased(R, _keep, _is_aliased_itensor(H_site))
+        end
+        P.LR[rl - 1] = R
+        roofline && _record_env_footprint(rl - 1, R, run_label)
+        rl -= 1
+    end
+    P.rpos = k
+    return R
 end
+
+# NOTE: env dispatch is unified under `position!(…; run_mode=:fused)` (abstractprojmpo.jl /
+# projmpo_mps.jl / projmposum.jl), which calls the `_fused_makeL!`/`_fused_makeR!` steppers
+# above for a concrete ProjMPO. There is no separate `fused_position!` entry point.

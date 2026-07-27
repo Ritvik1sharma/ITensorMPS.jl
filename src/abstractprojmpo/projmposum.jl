@@ -87,8 +87,10 @@ The MPS `psi` must have compatible bond indices with
 the previous projected MPO tensors for this
 operation to succeed.
 """
-function position!(A::AbstractSum, psi::MPS, pos::Int)
-    new_terms = map(term -> position!(term, psi, pos), terms(A))
+function position!(A::AbstractSum, psi::MPS, pos::Int; run_mode::Symbol=:standard, kwargs...)
+    # Forward run_mode (and roofline/run_label/debug) to each term's position!. Aliased
+    # terms fuse via the generic ProjMPO path; non-aliased terms self-guard to stock.
+    new_terms = map(term -> position!(term, psi, pos; run_mode=run_mode, kwargs...), terms(A))
     return set_terms(A, new_terms)
 end
 

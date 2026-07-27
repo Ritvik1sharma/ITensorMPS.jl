@@ -992,10 +992,27 @@ The MPS `psi` must have compatible bond indices with
 the previous projected MPO tensors for this
 operation to succeed.
 """
-function position!(P::AbstractProjMPO, psi::MPS, pos::Int; debug=false, roofline::Bool=false, run_label::String="?")
-    # println("Positioning ProjMPO ", debug)
-    makeL!(P, psi, pos - 1; debug=debug, roofline=roofline, run_label=run_label)
-    makeR!(P, psi, pos + nsite(P); debug=debug, roofline=roofline, run_label=run_label)
+function position!(P::AbstractProjMPO, psi::MPS, pos::Int; debug=false, roofline::Bool=false,
+                   run_label::String="?", run_mode::Symbol=:standard)
+    # run_mode=:fused swaps the env sweeps for the fused makeL/makeR kernel. It is ONLY valid
+    # for an aliased P†HP ProjMPO (the dense-ψ + aliased-PHP fast path) — anything else (a
+    # DiskProjMPO, any other AbstractProjMPO subtype, or a ProjMPO with a plain dense H) is a
+    # misuse and errors out LOUD rather than silently degrading to stock. (`_is_aliased_mpo`
+    # lives in dmrg_php.jl; the fused steppers in fused_mpo_helpers_env.jl — both resolved at
+    # call time, included after this file.) NOTE the per-STEP boundary fallback INSIDE
+    # `_fused_makeL!`/`_fused_makeR!` (OneITensor envs, 3-leg edge H) is structural, not
+    # misuse, and stays.
+    if run_mode === :fused
+        (P isa ProjMPO && _is_aliased_mpo(P.H)) || error(
+            "position!: run_mode=:fused requires an aliased P†HP ProjMPO (dense-ψ + aliased-PHP); got " *
+            (P isa ProjMPO ? "a ProjMPO with a non-aliased (dense) H MPO" : "a $(typeof(P))") *
+            ". Use run_mode=:standard for this operator.")
+        _fused_makeL!(P, psi, pos - 1; roofline=roofline, run_label=run_label)
+        _fused_makeR!(P, psi, pos + nsite(P); roofline=roofline, run_label=run_label)
+    else
+        makeL!(P, psi, pos - 1; debug=debug, roofline=roofline, run_label=run_label)
+        makeR!(P, psi, pos + nsite(P); debug=debug, roofline=roofline, run_label=run_label)
+    end
     return P
 end
 
