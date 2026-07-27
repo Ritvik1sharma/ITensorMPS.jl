@@ -14,8 +14,11 @@ include("abstractprojmpo/projmps.jl")
 include("abstractprojmpo/projmpo_mps.jl")
 include("abstractprojmpo/core_projmpo.jl")   # factor-core matvec operator (+ CoreProjMPO)
 include("abstractprojmpo/fused_mpo_helpers_partial_matvec.jl")   # partial fused H1·H2 matvec (aliased HPHP, dense ψ)
+include("abstractprojmpo/fused_mpo_helpers_env.jl")              # fused makeL/makeR env kernel + fused_position!
 include("observer.jl")
+include("dmrg_debug.jl")             # profiling / trace helpers for the dmrg sweep loop
 include("dmrg.jl")
+include("dmrg_php.jl")               # aliased-PHP + dense-ψ driver (run_mode :standard/:fused)
 include("factor_core_dmrg.jl")      # core-mode DMRG (:core_php), separated from dmrg.jl
 include("adapt.jl")
 include("opsum_to_mpo/matelem.jl")

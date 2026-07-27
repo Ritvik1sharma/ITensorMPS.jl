@@ -1,6 +1,5 @@
 using Adapt: adapt
 using KrylovKit: eigsolve, InnerProductVec
-const _EIGSOLVE_PHI_TRACE_COUNT = Ref(0)
 import VectorInterface
 using NDTensors: scalartype, timer
 using Printf: @printf
@@ -12,20 +11,14 @@ import SparseBackends
 # module scope so it's resolved once, not in the inner dmrg loop.
 VectorInterface.scalartype(::Type{ITensors.ITensor}) = ComplexF64
 
-# In-place aliased Lanczos add!! — the ITensorsVectorInterfaceExt extension runs
-# `a + b*α` directly for external storage (two allocations: the b*α template copy
-# + the Base.:+ `plus_merge` result — the dominant aliased-Krylov add cost). For
-# key-aligned dedup-1 aliased operands we do a truly in-place axpby (zero alloc,
-# no merge). To OVERRIDE the extension WITHOUT a precompile "method overwriting"
-# error, the methods below are strictly MORE SPECIFIC than the extension's
-# add!!(…, ::Number): ::Real and ::Complex cover every concrete α Lanczos produces
-# (the complex one is the 2-arg add!!'s one(ComplexF64)). HARDENED: the in-place
-# path is unconditional; it falls back to the extension's exact behavior only when
-# operands aren't key-aligned aliased storage ⇒ byte-identical in that case.
+# In-place aliased Lanczos add!!. The ITensorsVectorInterfaceExt extension runs `a + b*α`
+# for external storage (2 allocs: the b*α copy + the Base.:+ plus_merge — the dominant
+# aliased-Krylov add cost). For key-aligned dedup-1 aliased operands we do a true in-place
+# axpby (zero alloc, no merge). The ::Real/::Complex methods below are strictly MORE SPECIFIC
+# than the extension's add!!(…,::Number) (so no precompile "method overwriting" error) and
+# cover every concrete α Lanczos produces. Falls back to the extension's exact behavior when
+# operands aren't key-aligned aliased storage ⇒ byte-identical there.
 function _aliased_addbang!(a::ITensors.ITensor, b::ITensors.ITensor, α::Number, β::Number)
-  # HARDENED: the in-place aliased axpby is always attempted (it's bit-identical
-  # and strictly faster); it falls through below only when the operands aren't
-  # key-aligned aliased storage — a correctness condition, not a toggle.
   SparseBackends._ADD_INPLACE_TRY[] += 1
   awa = SparseBackends._alias_storage(a); bwa = SparseBackends._alias_storage(b)
   if awa !== nothing && bwa !== nothing &&
@@ -51,12 +44,10 @@ VectorInterface.add!!(a::ITensors.ITensor, b::ITensors.ITensor, α::Real, β::Re
   _aliased_addbang!(a, b, α, β)
 VectorInterface.add!!(a::ITensors.ITensor, b::ITensors.ITensor, α::Complex, β::Complex) =
   _aliased_addbang!(a, b, α, β)
-# NOTE: the analogous Lanczos `inner` (the `wrapped×wrapped` dots) cannot be
-# overridden the same way — its signature inner(::ITensor,::ITensor) is identical
-# to the extension's with no more-specific variant, and an __init__/@eval install
-# breaks the ChainRulesCore extension's precompile. The dot speedup will instead
-# be done at the SparseBackends contraction level (full aliased×aliased reduction
-# → scalar). For now `inner` keeps the extension's contraction path.
+# NOTE: the analogous Lanczos `inner` can't be overridden the same way — inner(::ITensor,
+# ::ITensor) matches the extension exactly (no more-specific variant) and an __init__/@eval
+# install breaks the ChainRulesCore extension's precompile. So `inner` keeps the extension's
+# path; the dot speedup will instead happen at the SparseBackends contraction level.
 
 function naive_overlap(psi1::MPS, psi2::MPS)
   psi1dag = dag(psi1)
@@ -88,9 +79,19 @@ function permute(
 end
 
 function dmrg(H::MPO, psi0::MPS, sweeps::Sweeps; P::Union{Nothing,MPO}=nothing,
+             run_mode::Symbol=:standard,
              target_energy=nothing, use_early_exit=true, last_sweep_energy=nothing, kwargs...)
+  run_mode in (:standard, :fused) ||
+    error("dmrg: unknown run_mode=$(run_mode); expected :standard or :fused")
   check_hascommoninds(siteinds, H, psi0)
   check_hascommoninds(siteinds, H, psi0')
+  # A plain block-sparse ψ (WrappedBlockSparse, not aliased) is not supported by this
+  # front-end: the only sparse-ψ path is factor-core, which expects an aliased ψ = P·core.
+  # Error out explicitly rather than misrouting a bare BS ψ into dmrg_core_php.
+  !SparseBackends.is_blocksparse_mps(psi0) ||
+    error("dmrg: a block-sparse (non-aliased) ψ is not supported. The only sparse-ψ path is " *
+          "the factor-core method (aliased ψ = P·core, via `P=`); use a dense ψ, or an aliased " *
+          "ψ with the constraint MPO `P=`.")
   # Aliased-ψ + dense-H is served ONLY by the factor-core method (ψ = P·core, metric I).
   # The old Path-B aliased run modes have been removed. Delegate to dmrg_core_php, which
   # needs the constraint MPO P explicitly (unlike Path-B, which derived M from the H-env).
@@ -106,8 +107,12 @@ function dmrg(H::MPO, psi0::MPS, sweeps::Sweeps; P::Union{Nothing,MPO}=nothing,
       eigsolve_tol=get(kwargs, :eigsolve_tol, 1e-12),
       outputlevel=get(kwargs, :outputlevel, 1))
   end
+  # run_mode threads into the single generic loop below. For an aliased-PHP operator +
+  # dense ψ it selects the matvec (and, later, env) kernel at the dispatch points; for a
+  # plain dense-H operator it is inert (the fused branches gate on an aliased H). Excited
+  # / Vector{MPO} runs receive run_mode via kwargs → the same inner loop.
   PH = ProjMPO(H)
-  return dmrg(PH, psi0, sweeps; target_energy, use_early_exit, kwargs...)
+  return dmrg(PH, psi0, sweeps; run_mode, target_energy, use_early_exit, kwargs...)
 end
 
 function constrained_dmrg(H::MPO, psi0::MPS, sweeps::Sweeps; parMPO=nothing, kwargs...)
@@ -296,103 +301,28 @@ end
 
 using NDTensors.TypeParameterAccessors: unwrap_array_type
 """
-    dmrg(H::MPO, psi0::MPS; kwargs...)
-    dmrg(H::MPO, psi0::MPS, sweeps::Sweeps; kwargs...)
+    dmrg(H::MPO, psi0::MPS; nsweeps, kwargs...)
+    dmrg(Hs::Vector{MPO}, psi0::MPS; nsweeps, kwargs...)
+    dmrg(H::MPO, Ms::Vector{MPS}, psi0::MPS; nsweeps, weight=1.0, kwargs...)
+    dmrg(…, sweeps::Sweeps; kwargs...)          # Sweeps-object form (no longer preferred)
 
-Use the density matrix renormalization group (DMRG) algorithm
-to optimize a matrix product state (MPS) such that it is the
-eigenvector of lowest eigenvalue of a Hermitian matrix `H`,
-represented as a matrix product operator (MPO).
+Optimize an MPS `psi0` via DMRG toward the lowest eigenvalue of a Hermitian `H`.
+Returns `(energy, psi)`.
 
-    dmrg(Hs::Vector{MPO}, psi0::MPS; kwargs...)
-    dmrg(Hs::Vector{MPO}, psi0::MPS, sweeps::Sweeps; kwargs...)
-
-Use the density matrix renormalization group (DMRG) algorithm
-to optimize a matrix product state (MPS) such that it is the
-eigenvector of lowest eigenvalue of a Hermitian matrix `H`.
-This version of `dmrg` accepts a representation of H as a
-Vector of MPOs, `Hs = [H1, H2, H3, ...]` such that `H` is defined
-`as H = H1 + H2 + H3 + ...`
-Note that this sum of MPOs is not actually computed; rather
-the set of MPOs `[H1,H2,H3,..]` is efficiently looped over at
-each step of the DMRG algorithm when optimizing the MPS.
-
-    dmrg(H::MPO, Ms::Vector{MPS}, psi0::MPS; weight=1.0, kwargs...)
-    dmrg(H::MPO, Ms::Vector{MPS}, psi0::MPS, sweeps::Sweeps; weight=1.0, kwargs...)
-
-Use the density matrix renormalization group (DMRG) algorithm
-to optimize a matrix product state (MPS) such that it is the
-eigenvector of lowest eigenvalue of a Hermitian matrix `H`,
-subject to the constraint that the MPS is orthogonal to each
-of the MPS provided in the Vector `Ms`. The orthogonality
-constraint is approximately enforced by adding to `H` terms of
-the form `w|M1><M1| + w|M2><M2| + ...` where `Ms=[M1, M2, ...]` and
-`w` is the "weight" parameter, which can be adjusted through the
-optional `weight` keyword argument.
-
-!!! note
-    `dmrg` will report the energy of the operator
-    `H + w|M1><M1| + w|M2><M2| + ...`, not the operator `H`.
-    If you want the expectation value of the MPS eigenstate
-    with respect to just `H`, you can compute it yourself with
-    an observer or after DMRG is run with `inner(psi', H, psi)`.
-
-The MPS `psi0` is used to initialize the MPS to be optimized.
-
-The number of sweeps of thd DMRG algorithm is controlled by
-passing the `nsweeps` keyword argument. The keyword arguments
-`maxdim`, `cutoff`, `noise`, and `mindim` can also be passed
-to control the cost versus accuracy of the algorithm - see below
-for details.
-
-Alternatively the number of sweeps and accuracy parameters can
-be passed through a `Sweeps` object, though this interface is
-no longer preferred.
-
-Returns:
-
-  - `energy::Number` - eigenvalue of the optimized MPS
-  - `psi::MPS` - optimized MPS
+- `Hs::Vector{MPO}` represents `H = H1 + H2 + …` (looped over, never actually summed).
+- `Ms::Vector{MPS}` runs excited-state DMRG: the state is kept orthogonal to each `Mᵢ`
+  by adding `w·Σ|Mᵢ⟩⟨Mᵢ|` (weight `w`). NOTE the reported energy is of `H + w·Σ|Mᵢ⟩⟨Mᵢ|`,
+  not `H` — for `⟨H⟩` use `inner(psi', H, psi)` afterward.
 
 Keyword arguments:
-
-  - `nsweeps::Int` - number of "sweeps" of DMRG to perform
-
-Optional keyword arguments:
-
-  - `maxdim` - integer or array of integers specifying the maximum size
-     allowed for the bond dimension or rank of the MPS being optimized.
-  - `cutoff` - float or array of floats specifying the truncation error cutoff
-     or threshold to use for truncating the bond dimension or rank of the MPS.
-  - `eigsolve_krylovdim::Int = 3` - maximum dimension of Krylov space used to
-     locally solve the eigenvalue problem. Try setting to a higher value if
-     convergence is slow or the Hamiltonian is close to a critical point. [^krylovkit]
-  - `eigsolve_tol::Number = 1e-14` - Krylov eigensolver tolerance. [^krylovkit]
-  - `eigsolve_maxiter::Int = 1` - number of times the Krylov subspace can be
-     rebuilt. [^krylovkit]
-  - `eigsolve_verbosity::Int = 0` - verbosity level of the Krylov solver.
-     Warning: enabling this will lead to a lot of outputs to the terminal. [^krylovkit]
-  - `ishermitian=true` - boolean specifying if dmrg should assume the MPO (or more
-     general linear operator) represents a Hermitian matrix. [^krylovkit]
-  - `noise` - float or array of floats specifying strength of the "noise term"
-     to use to aid convergence.
-  - `mindim` - integer or array of integers specifying the minimum size of the
-     bond dimension or rank, if possible.
-  - `outputlevel::Int = 1` - larger outputlevel values make DMRG print more
-     information and 0 means no output.
-  - `observer` - object implementing the [Observer](@ref observer) interface
-     which can perform measurements and stop DMRG early.
-  - `write_when_maxdim_exceeds::Int` - when the allowed maxdim exceeds this
-     value, begin saving tensors to disk to free RAM memory in large calculations
-  - `write_path::String = tempdir()` - path to use to save files to disk
-     (to save RAM) when maxdim exceeds the `write_when_maxdim_exceeds` option, if set
-
-[^krylovkit]:
-
-    The `dmrg` function in `ITensorMPS.jl` currently uses the `eigsolve`
-    function in `KrylovKit.jl` as the internal the eigensolver.
-    See the `KrylovKit.jl` documention on the `eigsolve` function for more details:
-    [KrylovKit.eigsolve](https://jutho.github.io/KrylovKit.jl/stable/man/eig/#KrylovKit.eigsolve).
+  - `nsweeps::Int` (required) - number of DMRG sweeps.
+  - `maxdim`, `mindim`, `cutoff`, `noise` - scalar or per-sweep array; bond-dim/accuracy control.
+  - `outputlevel::Int = 1` - 0 = silent, ≥2 = per-bond info.
+  - `observer` - Observer for measurements / early stop.
+  - `write_when_maxdim_exceeds::Int`, `write_path=tempdir()` - spill env tensors to disk above
+     the given maxdim (large runs).
+  - `eigsolve_tol=1e-14`, `eigsolve_krylovdim=3`, `eigsolve_maxiter=1`, `eigsolve_verbosity=0`,
+     `ishermitian=true` - local KrylovKit `eigsolve` controls.
 """
 function dmrg(
   PH,
@@ -417,25 +347,19 @@ function dmrg(
   tensor_tracker=nothing,
   only_store=false,
   debug=false,
-  # Consolidates the old SB_ROOFLINE / SB_FLOP_COUNT / SB_ENV_FOOTPRINT /
-  # SB_PERM_CAPTURE / GEMM_DIMS_HIST env vars (+ SB_PERMUTE_PROFILE's
-  # SparseBackends/ITensorMPS writers) into one switch. Only flips the
-  # enabled flag on every call (via set_roofline!) — does NOT reset the
-  # accumulators, so a per-sweep loop of dmrg(...) calls still accumulates
-  # stats across the whole run. Call SparseBackends.reset_roofline!(true)/
-  # reset_flops!(true) once yourself before such a loop to zero them first.
+  # Enable roofline/flop/footprint/permute-profile accumulators for this run (does not
+  # reset them — call SparseBackends.reset_roofline!/reset_flops! first for a fresh loop).
   roofline::Bool=false,
-  # Was SB_RUN_LABEL env var — a real threaded argument now (was a functional
-  # argument all along conceptually; test scripts pass it directly instead of
-  # setting ENV), tagging env-footprint/permute-profile records with which
-  # named run ("DENSE"/"ALIASED"/etc.) produced them. No correctness effect.
-  run_label::String="?"
+  # Tags env-footprint/permute-profile records with the run name ("DENSE"/"ALIASED"/…).
+  run_label::String="?",
+  # Kernel selector for the aliased-PHP + dense-ψ case (inert otherwise): :standard =
+  # stock per-leg aliased matvec (byte-identical to before); :fused = partial-fused
+  # matvec (matvec_partial_fused_full) on bulk bonds. See dispatch points below.
+  run_mode::Symbol=:standard
 )
-  # Was SB_ALIASED_TRACE — thread this call's debug flag into SparseBackends'
-  # trace Ref (not an ENV var), consulted by trace prints throughout the
-  # aliased pipeline. Each print site's own fire-count budget is a hardcoded
-  # literal, not separately configurable.
-  SparseBackends.ALIASED_TRACE[] = debug
+  run_mode in (:standard, :fused) ||
+    error("dmrg: unknown run_mode=$(run_mode); expected :standard or :fused")
+  SparseBackends.ALIASED_TRACE[] = debug   # route this call's debug flag to the aliased trace prints
   SparseBackends.set_roofline!(roofline)
   println("Use early exit is set to ", use_early_exit, " num sweeeps are ", nsweep(sweeps))
   if length(psi0) == 1
@@ -466,8 +390,13 @@ function dmrg(
     end
   end
 
+  # Is the operator an aliased P†HP MPO? Gates the φ-pin (below) and the fused matvec.
+  # Env fusion is handled inside position! via run_mode (self-guarded there).
+  _op_aliased_mpo = _dmrg_op_is_aliased(PH)
+  _op_is_aliased  = run_mode === :fused && _op_aliased_mpo
+
   t = @elapsed begin
-    PH = position!(PH, psi, 1; debug=false, roofline=roofline, run_label=run_label)
+    PH = position!(PH, psi, 1; roofline=roofline, run_label=run_label, run_mode=run_mode)
   end
 
   println("Time to position at start of DMRG: ", t, " seconds")
@@ -488,7 +417,6 @@ function dmrg(
   total_truncation_err = 0
   pos_time = 0.0
   opt_time = 0.0
-  only_idx = 1
 
   for sw in 1:nsweep(sweeps)
     sw_time = @elapsed begin
@@ -512,16 +440,13 @@ function dmrg(
           end
 
           timer = @elapsed begin
-            # Per-matvec bond-position context for permute-profile probes.
-            ITensorMPS._BOND_POSITION[] = b
-            ITensorMPS._SWEEP_NUM[] = sw
-            ENV["SB_BOND"] = string(b)
+            _dmrg_set_bond_context!(b, sw)   # permute-profile probe context (see dmrg_debug.jl)
             @timeit PROJMPO_TIMER "dmrg.position!" begin
-              ITensorMPS._IN_POSITION[] = true
+              _IN_POSITION[] = true
               try
-                PH = position!(PH, psi, b; roofline=roofline, run_label=run_label)
+                PH = position!(PH, psi, b; roofline=roofline, run_label=run_label, run_mode=run_mode)
               finally
-                ITensorMPS._IN_POSITION[] = false
+                _IN_POSITION[] = false
               end
             end
           end
@@ -533,103 +458,36 @@ function dmrg(
           end
 
           @timeit PROJMPO_TIMER "dmrg.phi_build" begin
-            # `preserve_bs_output=true` routes through ITensors' `*` to the aliased-
-            # preserving contraction when both site tensors are aliased blocksparse
-            # (and is a no-op for dense inputs), so φ keeps its aliased/dedup schema.
+            # preserve_bs_output=true keeps φ aliased/dedup when both site tensors are
+            # aliased blocksparse (no-op for dense inputs).
             phi = *(psi[b], psi[b + 1]; preserve_bs_output=true)
           end
-          # Dense-ψ: pin φ to a canonical (link,site,site,link) order every bond so the
-          # matvec sees a stable input layout each Krylov iteration (replacebond!'s SVD
-          # otherwise emits φ in drifting orders → the step-output perm varies, defeating
-          # a static table). Layout-only (a permute of φ); psi/H storage untouched, E
-          # convergence-equivalent. Applies to GROUND (ProjMPO) AND EXCITED
-          # (ProjMPOSum): reorder_to_roles only touches φ (no PH accessors needed), and
-          # the excited H-term is a ProjMPO whose contract runs the same step-1 swap +
-          # env canonicalization, so pinning φ makes the strided read fire for excited too.
-          if !SparseBackends.is_sparse_mps(psi)
+          # Fuse only on BULK bonds (partial-fused context needs both L and R envs); edge
+          # bonds fall back to stock. Use the INNER ProjMPO's envs (ProjMPO_MPS has none).
+          use_fused = false
+          if _op_is_aliased
+            _iph = _dmrg_inner_projmpo(PH)
+            use_fused = !(lproj(_iph) isa OneITensor) && !(rproj(_iph) isa OneITensor)
+          end
+          # Pin dense φ to the aliased kernel's strided-read layout (only when the operator
+          # is aliased — a dense-H matvec is order-agnostic, so no wasted permute there).
+          # Layout-only ⇒ E unchanged. :standard → [:l,:s2,:r,:s]; :fused → [:l,:r,:s2,:s].
+          if _op_aliased_mpo && !SparseBackends.is_sparse_mps(psi)
             @timeit PROJMPO_TIMER "dmrg.phi_reorder_dense" begin
-              # Layout-C target (s2⁰ = role :s LAST): with L reordered so step 1
-              # emits T1 = [red(l1⁴¹) | F1 | keepB(l1³¹,s3⁰,l3⁰) | s2⁰], step-2's B
-              # arrives red-leading + keepB-contiguous → the kernel's strided-read
-              # (K2) fires and permute_B@2 is skipped. E is label-based, so this
-              # order change is convergence-equivalent.
-              phi = SparseBackends.reorder_to_roles(phi, [:l, :s2, :r, :s])
+              phi = SparseBackends.reorder_to_roles(phi, use_fused ? [:l, :r, :s2, :s] :
+                                                              [:l, :s2, :r, :s])
             end
           end
 
-          SparseBackends.schema_dbg("eigsolve-OPERAND phi b=$b", phi)
+          _dmrg_probe_phi_in(phi, b, sw, ha)   # schema + keytrace dumps (see dmrg_debug.jl)
 
-          # Dumps psi[b]/psi[b+1]/phi's prefix/dense axis classification before
-          # the eigsolve. Debug-only, disabled; flip to `true` (and restore the
-          # body below) to re-enable.
-          if false
-          end
-          # if get(ENV, "SB_FACT_DIAG", "0") == "1"
-          #   _clsdump(lbl, T) = begin
-          #     if ITensors.has_external_storage(T) && T.tensor.data isa SparseBackends.WrappedAliasedBlockSparse
-          #       w = T.tensor.data; P = SparseBackends._abs_head_len(w); N = ndims(w.aliased)
-          #       println("   [", lbl, "] P=$P  prefix=",
-          #               [(ITensors.dim(w.inds[i]), string(ITensors.tags(w.inds[i])), ITensors.plev(w.inds[i])) for i in 1:P],
-          #               "  dense=",
-          #               [(ITensors.dim(w.inds[i]), string(ITensors.tags(w.inds[i])), ITensors.plev(w.inds[i])) for i in P+1:N])
-          #     else
-          #       println("   [", lbl, "] storage=", ITensors.has_external_storage(T) ? string(typeof(T.tensor.data)) : "dense")
-          #     end
-          #   end
-          #   println("[FACT_DIAG phi @ b=$b ha=$ha sw=$sw]")
-          #   _clsdump("psi[b]",   psi[b])
-          #   _clsdump("psi[b+1]", psi[b+1])
-          #   _clsdump("phi",      phi)
-          #   flush(stdout)
-          # end
-
-          # phi = canonicalize_phi_phase(phi)
-
-          # TRACE_IMAGE: capture the TRUE φ's constraint image (before M^{±1/2}) so the
-          # per-step matvec trace can flag intermediate keys outside image(φ).
-          SparseBackends.capture_phi_image!(phi)
-
-          # ── KEYTRACE (SB_KEYTRACE=1): trace the prefix-key set + index order at each
-          # stage of one bond (default b=2, sw=1, ha=1) to follow the M^{±1/2} key flow.
-          _keytrace = function(lbl, T)
-            _kt_bonds = Set(parse.(Int, split(get(ENV, "SB_KEYTRACE_BOND", "2"), ",")))
-            (get(ENV, "SB_KEYTRACE", "0") == "1" &&
-             (b in _kt_bonds) && sw == 1 && ha == 1) || return nothing
-            if T isa ITensors.ITensor && ITensors.has_external_storage(T) &&
-               ITensors.get_external_storage(T) isa SparseBackends.WrappedAliasedBlockSparse
-              w = ITensors.get_external_storage(T); a = w.aliased
-              P = SparseBackends._abs_head_len(w); Nn = length(w.inds)
-              _ord = [(ITensors.dim(w.inds[i]), string(ITensors.tags(w.inds[i])), ITensors.plev(w.inds[i])) for i in 1:Nn]
-              _dedup = round(length(a.keys) / max(a.n_templates, 1); digits=3)
-              # key → alias_id (template index) pairs, so the actual dedup GROUPING is visible:
-              _keymap = [(a.keys[i], Int(a.alias_ids[i])) for i in eachindex(a.keys)]
-              # group keys by template id to show which keys SHARE each template
-              _bytmpl = Dict{Int,Vector{eltype(a.keys)}}()
-              for i in eachindex(a.keys); push!(get!(_bytmpl, Int(a.alias_ids[i]), eltype(a.keys)[]), a.keys[i]); end
-              println("[KEYTRACE b=", b, " ", lbl, "] P=", P, " nb=", length(a.keys), " nt=", a.n_templates,
-                      " dedup=", _dedup, "x",
-                      "\n   inds(order)= ", _ord,
-                      "\n   sparse_prefix(1:P)= ", _ord[1:P],
-                      "\n   key=>template_id= ", _keymap,
-                      "\n   keys_sharing_each_template= ", sort(collect(_bytmpl)))
-            else
-              _st = (T isa ITensors.ITensor && ITensors.has_external_storage(T)) ?
-                    string(typeof(ITensors.get_external_storage(T))) : "dense/plain"
-              println("[KEYTRACE ", lbl, "] (", _st, ")")
-            end
-            flush(stdout); return nothing
-          end
-          # _keytrace("1.phi_original (template)", phi)  # disabled — uncomment to re-enable
-
-          # println("eigsolve at sweep $sw, half $ha, bond ($b, $(b+1))")
           time = @elapsed begin
             @timeit PROJMPO_TIMER "dmrg.eigsolve" begin
-              # Standard Lanczos local eigensolve. ψ here is always dense (an aliased
-              # ψ = P·core is routed to factor-core `dmrg_core_php` at the MPO front
-              # end). The operator PH may still be an aliased P†HP (dense-ψ+aliased-PHP
-              # fused path) — that is handled inside `product`/`position!`, not here.
+              # Bulk aliased-PHP bond under :fused → partial-fused matvec closure (+ stock
+              # projector terms for excited ProjMPO_MPS); otherwise the stock operator PH.
+              _mv_op = use_fused ? _dmrg_fused_matvec(PH, b) : PH
               vals, vecs = eigsolve(
-                PH,
+                _mv_op,
                 phi,
                 1,
                 eigsolve_which_eigenvalue;
@@ -653,13 +511,7 @@ function dmrg(
           else
             vecs[1]
           end
-          SparseBackends.schema_dbg("eigsolve-RESULT phi b=$b", phi)
-          # _keytrace("5.phi before factorize (= vecs[1], post any drop)", phi)  # disabled — uncomment to re-enable
-          if SparseBackends.ALIASED_TRACE[] && _EIGSOLVE_PHI_TRACE_COUNT[] < 5
-            _EIGSOLVE_PHI_TRACE_COUNT[] += 1
-            phi_st = ITensors.has_external_storage(phi) ? typeof(phi.tensor.data) : "dense"
-            println("[SB_ALIASED_TRACE eigsolve returned #$(_EIGSOLVE_PHI_TRACE_COUNT[])]  phi storage=$phi_st  b=$b")
-          end
+          _dmrg_probe_phi_out(phi, b)
 
           ortho = ha == 1 ? "left" : "right"
 
@@ -677,24 +529,6 @@ function dmrg(
             checkflux(phi)
           end
 
-          replace_debug = false
-          if b == 3
-            replace_debug = true
-          end
-
-          # ── FACT_KEY (before/after factorize key diff) ──────────────────────
-          # Capture φ's key set going INTO replacebond!, then reconstitute the
-          # post-SVD two-site tensor and diff: keys in φ but gone after = what the
-          # factorize truncation actually discards (the provably-safe-to-drop set).
-          # Debug-only, disabled; flip to `true` (and restore the two bodies —
-          # here and further below at the matching `if _factkey` block) to
-          # re-enable.
-          _factkey = false
-          _fk_in = nothing
-          # if _factkey && ITensors.has_external_storage(phi) &&
-          #    ITensors.get_external_storage(phi) isa SparseBackends.WrappedAliasedBlockSparse
-          #   _fk_in = Set(ITensors.get_external_storage(phi).aliased.keys)
-          # end
           t = @elapsed begin
             @timeit PROJMPO_TIMER "dmrg.replacebond!" begin
               spec = replacebond!(
@@ -713,36 +547,9 @@ function dmrg(
               )
             end
           end
-          # if _factkey && _fk_in !== nothing
-          #   try
-          #     _phiw = ITensors.get_external_storage(phi)
-          #     _aw = ITensors.get_external_storage(psi[b]); _bw = ITensors.get_external_storage(psi[b+1])
-          #     _rw = SparseBackends.wrapped_contract_aliased(_aw, _bw; preserve_bs_output=true)
-          #     _rw = _rw isa ITensors.ITensor ? ITensors.get_external_storage(_rw) : _rw
-          #     if _rw isa SparseBackends.WrappedAliasedBlockSparse
-          #       _rw = SparseBackends.align_aliased_axes(_rw, _phiw)   # align axes to φ
-          #       _rw = _rw isa ITensors.ITensor ? ITensors.get_external_storage(_rw) : _rw
-          #     end
-          #     _outkeys = (_rw isa SparseBackends.WrappedAliasedBlockSparse) ? Set(_rw.aliased.keys) : Set(eltype(_fk_in)[])
-          #     _dropped = setdiff(_fk_in, _outkeys); _added = setdiff(_outkeys, _fk_in)
-          #     println("[FACT_KEY b=", b, " ha=", ha, " sw=", sw, "] phi_in=", length(_fk_in),
-          #             " recon_out=", length(_outkeys), " dropped(in∖out)=", length(_dropped),
-          #             " added(out∖in)=", length(_added))
-          #     flush(stdout)
-          #   catch e
-          #     println("[FACT_KEY b=", b, "] recon failed: ", sprint(showerror, e)); flush(stdout)
-          #   end
-          # end
-          SparseBackends.schema_dbg("replacebond-OUT psi[$b]", psi[b])
-          SparseBackends.schema_dbg("replacebond-OUT psi[$(b+1)]", psi[b+1])
-
-          # println("================ print here ================ ", ITensors.has_external_storage(phi))
+          _dmrg_probe_bond_out(psi, b)
 
           maxtruncerr = max(maxtruncerr, spec.truncerr)
-
-          # Path-B: no gram-cache update needed — the gram is sliced fresh from
-          # the H-env each bond (Stage 1), and the H-env is maintained by
-          # position!/makeL!/makeR!. (Superseded update_left!/update_right!.)
 
           @debug_check begin
             checkflux(psi)
@@ -776,16 +583,11 @@ function dmrg(
             outputlevel,
             sweep_is_done,
           )
-
-          only_idx += 1
         end
       end
       println(" Check time breakdown ", "Time spent in position! ", pos_time, " seconds. Time spent in optimization step (eigsolve + replacebond!) ", opt_time, " seconds.")
       pos_time, opt_time = 0.0, 0.0
     end
-    #   only_idx += 1
-    #   check_equality!(tensor_tracker, PH, psi; only_store=only_store, only_idx=only_idx)
-    # end
     println("=====================================")
 
     if outputlevel >= 1
