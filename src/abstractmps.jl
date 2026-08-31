@@ -1609,7 +1609,29 @@ bond indices is performed. Afterward, tensors
 Either modify in-place with `orthogonalize!` or
 out-of-place with `orthogonalize`.
 """
-function orthogonalize!(M::AbstractMPS, j::Int; maxdim = nothing, normalize = nothing)
+function orthogonalize!(M::AbstractMPS, j::Int; maxdim = nothing, normalize = nothing,
+                        cutoff = nothing)
+    # `cutoff` was hardcoded to 0.0 in all four external-storage branches below, so the
+    # sweep could never discard a zero-weight singular direction. For an aliased psi that
+    # is not a minor default: itensor_aliased_factorize refactorizes the MULTIPLICITY bond
+    # only (keys, alias_ids, scalars and the channel axis are inherited verbatim), which is
+    # exactly the axis the gate's virtual bond accumulates on. With cutoff = 0 that bond is
+    # retained in full even when only one direction carries weight, so the multiplicity
+    # inflates every layer and compounds.
+    #
+    # Measured on the D4 ring at Nm=3, one gate layer: nominal multiplicity [2,4,4,4,2]
+    # against an effective multiplicity of [1,1,1,1,1]. Route C avoids it only because
+    # `apply(G, core)` SVDs the product and absorbs the gate bond.
+    #
+    # Same failure mode as `apply(d4_UB_gates(...); cutoff = 0.0, ...)`, which inflated the
+    # core bond by 2^Nm from a product state (see apply_UB in d4_ring_model.jl).
+    #
+    # Scope: `_cut` reaches ONLY the two itensor_aliased_factorize branches (left and
+    # right sweeps). The two blocksparse branches keep their literal 0.0 -- they are not on
+    # the G*(P*core) path and have no reason to gain the knob.
+    #
+    # Default stays `nothing` -> 0.0, so existing callers (DMRG included) are unchanged.
+    _cut = something(cutoff, 0.0)
     # TODO: Delete `maxdim` and `normalize` keyword arguments.
     @debug_check begin
         if !(1 <= j <= length(M))
@@ -1653,7 +1675,7 @@ function orthogonalize!(M::AbstractMPS, j::Int; maxdim = nothing, normalize = no
                     phi, M[b], M[b + 1];
                     ortho  = "left",
                     maxdim = something(maxdim, typemax(Int)),
-                    mindim = 1, cutoff = 0.0,
+                    mindim = 1, cutoff = _cut,
                 )
                 SparseBackends.schema_dbg("orthoL b=$b: L (factorized)", L)
                 SparseBackends.schema_dbg("orthoL b=$b: R (factorized)", R)
@@ -1715,7 +1737,7 @@ function orthogonalize!(M::AbstractMPS, j::Int; maxdim = nothing, normalize = no
                     phi, M[b], M[b + 1];
                     ortho  = "right",
                     maxdim = something(maxdim, typemax(Int)),
-                    mindim = 1, cutoff = 0.0,
+                    mindim = 1, cutoff = _cut,
                 )
                 if SparseBackends.ALIASED_TRACE[]
                     println("  RIGHT L=", typeof(L.tensor.data), "  R=", typeof(R.tensor.data))
