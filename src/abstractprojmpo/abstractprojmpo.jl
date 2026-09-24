@@ -111,6 +111,45 @@ _p(::SparseBackends.AliasedBlockSparse{T,N,N2,P,K}) where {T,N,N2,P,K} = ntuple(
     return m
 end
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Env contraction ORDER (SB_ENV_ORDER)
+# ─────────────────────────────────────────────────────────────────────────────
+# This fork associates the env build differently from stock ITensorMPS:
+#
+#   stock (packages/):  L = L * psi * H * dag(prime(psi))      → (L·ψ)·H·ψ'†
+#   this fork:          L = ((L * H) * dag(prime(psi))) * psi  → (L·H)·ψ'†·ψ
+#
+# The fork order exists to feed `_reorder_env_for_aliased` (FusedSparse axes last
+# ⇒ the matvec kernel can skip its per-call permute_B), but it is NOT free. With
+# MPS bond χ, MPO bond w and physical dim d:
+#
+#   stock      first intermediate w·d·χ²    total ≈ 2wdχ³ + w²d²χ²
+#   this fork  first intermediate w·d²·χ²   total ≈ w²d²χ² + wdχ³(d+1)
+#
+# i.e. at d=3 the χ³ term is ~2× larger and the first intermediate ~d× bigger.
+# Whether that costs more END TO END is not obvious — reverting may simply move
+# the cost from position! into permute_B — so this is a runtime switch, not an
+# edit. Default is unchanged (`:fork`); `SB_ENV_ORDER=stock` selects the stock
+# association for A/B testing.
+#
+# Scope note: position! is only ~8% of DMRG wall time on the configs measured, so
+# the ceiling on this whole question is a few percent. Read `:stock` results with
+# that bound in mind.
+# Read LAZILY, not at module top level: this file is precompiled, so a bare
+# `Ref(get(ENV, ...))` here would capture the environment of the PRECOMPILE
+# process and bake it into the .ji cache — the switch would then silently ignore
+# SB_ENV_ORDER at run time (and worse, could stick on for every later job that
+# reused the cache). -1 = not yet read; resolved on first call and cached.
+const _ENV_ORDER_STOCK = Ref(-1)
+@inline function _env_order_stock()
+    v = _ENV_ORDER_STOCK[]
+    if v < 0
+        v = get(ENV, "SB_ENV_ORDER", "fork") == "stock" ? 1 : 0
+        _ENV_ORDER_STOCK[] = v
+    end
+    return v == 1
+end
+
 @inline function _env_mul(A, B, keep::Bool)
     # _env_mul is only ever called from _makeL!/_makeR! (position!'s
     # env-building code) — structurally always "position", so in_position=true
@@ -850,6 +889,11 @@ function _makeL!(P::AbstractProjMPO, psi::MPS, k::Int; debug=false, roofline::Bo
             # run), so its multiplicity axes stay dense in the matvec output.
             # Hardened 2026-06 — always on (was SB_ALIASED_AA_ENV, default-on knob).
             _keep_env = _is_aliased_itensor(H_site) && _is_aliased_itensor(psi[ll + 1])
+            # SB_ENV_ORDER=stock → contract ψ FIRST, matching stock ITensorMPS'
+            # L*psi*H*dag(prime(psi)); the H multiply below then completes
+            # (L·ψ)·H and the ψ'† multiply closes it. Default (:fork) leaves the
+            # original (L·H)·ψ'†·ψ association untouched. See _ENV_ORDER_STOCK.
+            _env_order_stock() && (L = _env_mul(L, psi[ll + 1], _keep_env))
             L = _env_mul(L, H_site, _keep_env)
             if _env_dbg && _ENV_DBG_COUNT[] <= _env_dbg_max
                 println("  L (after × H_site) inds = ", inds(L))
@@ -875,7 +919,9 @@ function _makeL!(P::AbstractProjMPO, psi::MPS, k::Int; debug=false, roofline::Bo
                 rethrow(e)
             end
             # L = L * dag(prime(psi[ll + 1]))
-            L = _env_mul(L, psi[ll + 1], _keep_env)
+            # Under :stock the ψ multiply already happened before H, so skip it
+            # here — doing it twice would contract ψ into L a second time.
+            _env_order_stock() || (L = _env_mul(L, psi[ll + 1], _keep_env))
             # Reorder so "FusedSparse" axes go last → matvec kernel sees
             # canonical layout and skips its per-call permute_B. (Skipped for the
             # both-aliased env inside _reorder_env_for_aliased.)
@@ -954,12 +1000,15 @@ function _makeR!(P::AbstractProjMPO, psi::MPS, k::Int; debug=false, roofline::Bo
             end
             # Hardened 2026-06 — always on (was SB_ALIASED_AA_ENV, default-on knob).
             _keep_env = _is_aliased_itensor(H_site) && _is_aliased_itensor(psi[rl - 1])
+            # SB_ENV_ORDER=stock → ψ first, mirroring stock's
+            # R*psi[rl-1]*H[rl-1]*dag(prime(psi[rl-1])). See _ENV_ORDER_STOCK.
+            _env_order_stock() && (R = _env_mul(psi[rl - 1], R, _keep_env))
             R = _env_mul(R, H_site, _keep_env)
             if _env_dbg2 && _ENV_DBG_COUNT[] <= _env_dbg2_max
                 println("  R (after × H_site) inds = ", inds(R))
             end
             R = _env_mul(dag(prime(psi[rl - 1])), R, _keep_env)
-            R = _env_mul(psi[rl - 1], R, _keep_env)
+            _env_order_stock() || (R = _env_mul(psi[rl - 1], R, _keep_env))
             R = _reorder_env_for_aliased(R, _keep_env, _is_aliased_itensor(H_site))
             if _env_dbg2 && _ENV_DBG_COUNT[] <= _env_dbg2_max
                 println("  R (after × dag(psi') × psi, post-reorder) FINAL inds = ", inds(R))
@@ -1002,16 +1051,28 @@ function position!(P::AbstractProjMPO, psi::MPS, pos::Int; debug=false, roofline
     # call time, included after this file.) NOTE the per-STEP boundary fallback INSIDE
     # `_fused_makeL!`/`_fused_makeR!` (OneITensor envs, 3-leg edge H) is structural, not
     # misuse, and stays.
+    # makeL!/makeR! are timed SEPARATELY (not just under dmrg.position!): a DMRG
+    # sweep moves one way at a time, so the two are load-imbalanced by direction
+    # and a combined number hides which sweep half is paying. Both nest under
+    # dmrg.position! in the caller's tree.
     if run_mode === :fused
         (P isa ProjMPO && _is_aliased_mpo(P.H)) || error(
             "position!: run_mode=:fused requires an aliased P†HP ProjMPO (dense-ψ + aliased-PHP); got " *
             (P isa ProjMPO ? "a ProjMPO with a non-aliased (dense) H MPO" : "a $(typeof(P))") *
             ". Use run_mode=:standard for this operator.")
-        _fused_makeL!(P, psi, pos - 1; roofline=roofline, run_label=run_label)
-        _fused_makeR!(P, psi, pos + nsite(P); roofline=roofline, run_label=run_label)
+        @timeit PROJMPO_TIMER "env.fused_makeL!" begin
+            _fused_makeL!(P, psi, pos - 1; roofline=roofline, run_label=run_label)
+        end
+        @timeit PROJMPO_TIMER "env.fused_makeR!" begin
+            _fused_makeR!(P, psi, pos + nsite(P); roofline=roofline, run_label=run_label)
+        end
     else
-        makeL!(P, psi, pos - 1; debug=debug, roofline=roofline, run_label=run_label)
-        makeR!(P, psi, pos + nsite(P); debug=debug, roofline=roofline, run_label=run_label)
+        @timeit PROJMPO_TIMER "env.makeL!" begin
+            makeL!(P, psi, pos - 1; debug=debug, roofline=roofline, run_label=run_label)
+        end
+        @timeit PROJMPO_TIMER "env.makeR!" begin
+            makeR!(P, psi, pos + nsite(P); debug=debug, roofline=roofline, run_label=run_label)
+        end
     end
     return P
 end
