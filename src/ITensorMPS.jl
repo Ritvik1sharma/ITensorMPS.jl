@@ -49,4 +49,8 @@ include("solvers/reducedlinearproblem.jl")
 include("solvers/linsolve.jl")
 include("solvers/expand.jl")
 include("lib/Experimental/src/Experimental.jl")
+# LAST: the workload calls MPO/MPS + sparse-backend methods, so every one of them
+# must already be defined. Caches the specialisations that otherwise cost ~11 min
+# of codegen per process -- see the header of precompile_sparse.jl.
+include("precompile_sparse.jl")
 end
