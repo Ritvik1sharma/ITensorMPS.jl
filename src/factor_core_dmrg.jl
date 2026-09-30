@@ -45,50 +45,49 @@ function _core_read_window(psi::MPS, sites)
     return c
 end
 
-# Resize-capable write_core!: drop a dense single-site `core` into ψ[j]'s aliased
-# template slots. Keeps the P structure (keys/alias_ids/scalars, P-FSM channels)
-# FIXED; the core-link Index/dim/blksize come from `core` (so the bond may grow or
-# shrink). Returns a fresh aliased ITensor (the core-link Index changes).
-function _core_rebuild(t::ITensor, core::ITensor)
-    w = _core_ext(t); a = w.aliased
-    Pn = SparseBackends._abs_head_len(w)
-    prefix_inds = w.inds[1:Pn]
-    phys_pos = findfirst(i -> ITensors.hastags(w.inds[i], "Site"), 1:Pn)
-    phys_ind = w.inds[phys_pos]
-    new_dense_inds = [i for i in inds(core) if !ITensors.hastags(i, "Site")]
-    new_dense_dims = Tuple(ITensors.dim(i) for i in new_dense_inds)
-    core_arr = Array(core, phys_ind, new_dense_inds...)
-    new_bs = prod(new_dense_dims)
-    s2t = SparseBackends.slice_to_template(w)
-    new_templates = Vector{eltype(a.templates)}(undef, a.n_templates * new_bs)
-    tail_ci = CartesianIndices(new_dense_dims)
-    seen = falses(a.n_templates)
-    @inbounds for s in 1:a.dims[phys_pos]
-        tid = s2t[s]; tid == 0 && continue
-        seen[tid] && error("factor-core: template $tid shared by 2 slices"); seen[tid] = true
-        off = (tid - 1) * new_bs
-        for (lin, ci) in enumerate(tail_ci)
-            new_templates[off + lin] = core_arr[s, Tuple(ci)...]
-        end
+# Write-back for an aliased ψ, reached through `replacebond!`. The type of `x` picks
+# the algorithm:
+#   dense ITensor → x is the 2-site core: SparseBackends.core_split (factor-core DMRG,
+#                   the default)
+#   aliased φ     → SparseBackends.itensor_aliased_factorize: direct template-space split
+#                   of φ, placed by the template pairs read off φ, ψ[b], ψ[b+1]
+# Both need φ / the core to come from the current ψ[b], ψ[b+1]. On a φ that is exactly
+# P·core the two give the same state.
+# ortho="left": left-iso at b; "right": right-iso at b+1. Truncates on the core bond.
+function aliased_replacebond!(psi::MPS, b::Int, x::ITensor;
+                              ortho = nothing, maxdim = nothing, mindim = nothing,
+                              cutoff = nothing, normalize = nothing,
+                              eigen_perturbation = nothing)
+    ortho = something(ortho, "left")
+    something(normalize, false) &&
+        error("replacebond!: normalize=true is not supported for an aliased ψ " *
+              "(the factors are core-orthonormal, so a site norm is not ψ's norm)")
+    eigen_perturbation === nothing ||
+        error("replacebond!: eigen_perturbation (noise) is not supported for an aliased ψ")
+    kw = (; ortho, maxdim = something(maxdim, typemax(Int)), mindim = something(mindim, 1),
+          cutoff = Float64(something(cutoff, 0.0)), tags = "Link,l=$b")
+    L, R, spec = if ITensors.has_external_storage(x)
+        SparseBackends.itensor_aliased_factorize(x, psi[b], psi[b + 1]; kw...)
+    else
+        SparseBackends.core_split(psi[b], psi[b + 1], x; kw...)
     end
-    new_dims = (ntuple(i -> a.dims[i], Pn)..., new_dense_dims...)
-    new_ali  = typeof(a)(new_dims, new_bs, new_templates, a.n_templates,
-                         copy(a.keys), copy(a.alias_ids), copy(a.scalars))
-    # preserve the pre-P routing map (P structure unchanged) so read_core stays general
-    # (off-diagonal P) across the sweep instead of re-deriving by output-site grouping.
-    isempty(a.slice_to_template) || (new_ali.slice_to_template = copy(a.slice_to_template))
-    return ITensors._itensor_from_external_storage(typeof(w)(new_ali, (prefix_inds..., new_dense_inds...)))
+    psi[b]     = L
+    psi[b + 1] = R
+    if ortho == "left"
+        leftlim(psi)  == b - 1 && setleftlim!(psi,  leftlim(psi) + 1)
+        rightlim(psi) == b + 1 && setrightlim!(psi, rightlim(psi) + 1)
+    else
+        leftlim(psi)  == b     && setleftlim!(psi,  leftlim(psi) - 1)
+        rightlim(psi) == b + 2 && setrightlim!(psi, rightlim(psi) - 1)
+    end
+    return spec
 end
 
-# Write the ground 2-site core `cg` back into ψ[b], ψ[b+1].
-# ha=1 (L→R): left-iso at b;  ha=2 (R→L): right-iso at b+1. Truncates on the core bond.
+# Write the 2-site core `cg` back into ψ[b], ψ[b+1] (canonicalization; no lims update).
+# ha=1 (L→R): left-iso at b;  ha=2 (R→L): right-iso at b+1.
 function _core_writeback!(psi::MPS, b::Int, cg::ITensor, ha::Int; maxdim::Int, cutoff::Real, mindim::Int=1)
-    left_inds = commoninds(cg, _core_readcore(psi[b]))         # (s_b, left core-link)
-    F = svd(cg, left_inds...; lefttags="Link,l=$b", maxdim=maxdim, mindim=mindim, cutoff=cutoff)
-    U, S, V = F.U, F.S, F.V
-    cb, cb1 = ha == 1 ? (U, S * V) : (U * S, V)
-    psi[b]   = _core_rebuild(psi[b],   cb)
-    psi[b+1] = _core_rebuild(psi[b+1], cb1)
+    psi[b], psi[b+1], _ = SparseBackends.core_split(psi[b], psi[b+1], cg;
+        ortho = ha == 1 ? "left" : "right", maxdim, mindim, cutoff, tags = "Link,l=$b")
     return psi
 end
 
@@ -138,11 +137,11 @@ function dmrg_core_php(H::MPO, P::MPO, psi0::MPS; nsweeps::Int, maxdim::Int, min
             # applies the operator → new channel-free core. In-place is safe: product
             # fully contracts φ each call.
             core0   = _core_read_window(psi, b:b+1)
-            # Build the aliased window with emit_window_map=true so the AliasedBS×AliasedBS
-            # contract EMITS the joined pre-P (rv_b,rv_{b+1})→template map (the routing that
-            # can't be recovered post-hoc for flip P). Correct for diagonal AND flip P.
+            # The (rv_b,rv_{b+1})→template map is derived from φ, ψ[b], ψ[b+1] (template
+            # pairs from the keys, then each site's slice_to_template). Correct for
+            # diagonal AND flip P.
             phi_buf = SparseBackends.contract(psi[b], psi[b+1], :aliased, :aliased, :aliased;
-                                              preserve_bs_output=true, emit_window_map=true)
+                                              preserve_bs_output=true)
             w_buf   = ITensors.get_external_storage(phi_buf)
             wmap    = SparseBackends.window_write_map(w_buf,
                           ITensors.get_external_storage(psi[b]),
@@ -150,7 +149,9 @@ function dmrg_core_php(H::MPO, P::MPO, psi0::MPS; nsweeps::Int, maxdim::Int, min
             f(core) = (SparseBackends.write_core_window!(w_buf, core, wmap); product(cpm, phi_buf))
             _, vecs = eigsolve(f, core0, 1, :SR; ishermitian=true,
                                krylovdim=eigsolve_krylovdim, tol=eigsolve_tol)
-            _core_writeback!(psi, b, vecs[1], ha; maxdim=maxdim, mindim=mindim, cutoff=cutoff)
+            # dense core → the dense-core write-back (aliased_replacebond!)
+            replacebond!(psi, b, vecs[1]; ortho = ha == 1 ? "left" : "right",
+                         maxdim, mindim, cutoff)
         end
         E = core_php_energy(psi, H)
         mbd = maximum(j -> maximum(ITensors.dim, ITensors.get_external_storage(psi[j]).inds), 1:N)
