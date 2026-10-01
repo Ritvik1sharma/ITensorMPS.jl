@@ -127,14 +127,11 @@ end
 #   this fork  first intermediate w·d²·χ²   total ≈ w²d²χ² + wdχ³(d+1)
 #
 # i.e. at d=3 the χ³ term is ~2× larger and the first intermediate ~d× bigger.
-# Whether that costs more END TO END is not obvious — reverting may simply move
-# the cost from position! into permute_B — so this is a runtime switch, not an
-# edit. Default is unchanged (`:fork`); `SB_ENV_ORDER=stock` selects the stock
-# association for A/B testing.
-#
-# Scope note: position! is only ~8% of DMRG wall time on the configs measured, so
-# the ceiling on this whole question is a few percent. Read `:stock` results with
-# that bound in mind.
+# Default is `:stock`, from a paired same-node timing ($SCRATCH/envorder_aliased,
+# 2026-09-30; KL v26/v66, PXP bd20/60/120, 3 seeds, sweeps 2..n): per sweep,
+# stock/fork = 0.92–0.99 for the dense-H matvec and 0.90–0.99 for the aliased
+# standard matvec (one noisy exception, 1.02), and the fused path is untouched
+# (bit-identical energies under both). `SB_ENV_ORDER=fork` restores the old order.
 # Read LAZILY, not at module top level: this file is precompiled, so a bare
 # `Ref(get(ENV, ...))` here would capture the environment of the PRECOMPILE
 # process and bake it into the .ji cache — the switch would then silently ignore
@@ -144,7 +141,7 @@ const _ENV_ORDER_STOCK = Ref(-1)
 @inline function _env_order_stock()
     v = _ENV_ORDER_STOCK[]
     if v < 0
-        v = get(ENV, "SB_ENV_ORDER", "fork") == "stock" ? 1 : 0
+        v = get(ENV, "SB_ENV_ORDER", "stock") == "fork" ? 0 : 1
         _ENV_ORDER_STOCK[] = v
     end
     return v == 1
