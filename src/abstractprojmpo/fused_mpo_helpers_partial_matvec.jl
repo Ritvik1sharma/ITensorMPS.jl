@@ -54,15 +54,15 @@ struct PartialMatvecContext{T}
 
     step2::Matrix{Vector{PartialStepRecord{T}}}   # (n_ham_mid_ch, d2) -> H2 records (stepC)
     step1c::Matrix{Vector{PartialStepRecord{T}}}  # (n_ham_mid_ch, d1) -> H1 records bucketed by mid-CHANNEL,
-                                                  #   sorted (src_pos=lpos, tid) so buf1 dedups per cell.
-                                                  #   Drives the per-channel loop (cache-resident x2c). (stepB)
+                                                  #   sorted (src_pos=lpos, tid).
+                                                  #   Drives the per-channel loop (one-channel x2c). (stepB)
 
     # ---- preallocated per-call scratch (reused across Krylov iterations) ----
     # Single-threaded assumption (KrylovKit runs serial). Buffers' CONTENTS are
     # overwritten each call; nothing escapes except a freshly-allocated T3 buffer.
-    buf1::Matrix{T}           # (dr1, chiL_bra*chiR_ket*d2)                        step B
-    x2c::Array{T,5}           # (dr1, chiL_bra, chiR_ket, d1[s1'], d2[s2]) ONE-CHANNEL accumulator
-                              #   — ~1/n_ham_mid_ch the size of the old full x2, stays L2/L3-resident.
+    x2c::Array{T,5}           # (dr1, chiL_bra, chiR_ket, d2[s2], d1[s1']) ONE-CHANNEL accumulator.
+                              #   s1' is the SLOWEST axis so each stepB GEMM writes one contiguous
+                              #   (dr1, chiL_bra·chiR_ket·d2) slab; stepC reads it per (s2, s1').
 
     # ---- pre-arranged env matrices (v-independent → built once/bond) for the
     #      full-wrapper's explicit-BLAS step 1 & step 4 (no ITensors * permutes) ----
@@ -177,10 +177,7 @@ function build_partial_matvec_context(P, si::Int)
     end
 
     # Channel-bucketed records for the per-channel kernel loop: step1c[m, s1] holds
-    # the H1 records routing INTO mid-channel m. Sorted by (src_pos=lpos, tid) so
-    # buf1 = templateᵀ·M1mat_{lpos} is recomputed only when (lpos, tid) changes
-    # within a channel cell (per-channel dedup; the cross-channel dedup is traded
-    # away in exchange for a cache-resident one-channel accumulator).
+    # the H1 records routing INTO mid-channel m, sorted by (src_pos=lpos, tid).
     step1c = [PartialStepRecord{T}[] for _ in 1:n_ham_mid_ch, _ in 1:d1]
     for (i, key) in enumerate(cls1.A.keys)
         lval, sval, spval, mval = key[cls1.l_pos], key[cls1.s_pos], key[cls1.sp_pos], key[cls1.r_pos]
@@ -198,8 +195,7 @@ function build_partial_matvec_context(P, si::Int)
     dl2_fast = cls2.dl_ind === inds(H2w)[5]
 
     # ---- preallocate all per-call scratch once (reused across Krylov iterations) ----
-    buf1 = Matrix{T}(undef, dr1, chiL_bra*chiR_ket*d2)
-    x2c  = Array{T,5}(undef, dr1, chiL_bra, chiR_ket, d1, d2)   # ONE channel — cache-resident
+    x2c  = Array{T,5}(undef, dr1, chiL_bra, chiR_ket, d2, d1)   # ONE channel; s1' slowest
     T3g_buf = Array{T,6}(undef, chiL_bra, d1, d2, chiR_ket, dr2, n_ham_right_ch)  # step-4 gather dest
 
     # Templates are READ-ONLY GEMM operands → alias H's banks directly when the
@@ -212,7 +208,7 @@ function build_partial_matvec_context(P, si::Int)
         chiL_bra, chiR_ket, chiL_ket, chiR_bra, n_ham_left_ch, n_ham_mid_ch, n_ham_right_ch,
         tmpl1, tmpl2, cls1.A.blksize, cls2.A.blksize,
         step2, step1c,
-        buf1, x2c,
+        x2c,
         Lenv_mat, Renv_mat, T3g_buf,
         cls1.dl_ind, cls1.l_ind, Lbra, Rket, s1_ind, s2_ind,
         cls2.dr_ind, cls2.r_ind,
@@ -250,12 +246,13 @@ end
 # a fresh T3buf = (dr2, chiL_bra, chiR_ket, d1[s1'], d2[s2'], n_ham_right_ch). Shared by
 # both wrappers so the two never diverge.
 #
-# One mid-channel m at a time so the accumulator x2c (one channel ≈ 1/n_ham_mid_ch the
-# full size) stays L2/L3-resident: stepB scatters H1 into x2c, stepC drains it
-# into T3 — x2c never spills to RAM. buf1 dedups per (lpos,tid) WITHIN a channel
-# cell (cross-channel dedup traded for the cache win; buf1 GEMMs are cheap,
-# K=dl1). stepC accumulates straight into T3's contiguous (sp2,r) slice
-# (α=rec.c, β=1) — no buf2, no scatter.
+# One mid-channel m at a time, so the accumulator x2c is one channel (≈ 1/n_ham_mid_ch
+# of the full intermediate): stepB writes H1 into x2c, stepC drains it into T3.
+# x2c is stored (dr1, Lbra, Rket, s2, s1'), s1' slowest, so each stepB block GEMM
+# accumulates straight into one contiguous slab x2c[:,:,:,:,s1'] (α=rec.c, β=1) — no
+# scratch buffer and no separate add pass. stepC then reads x2c in d1 contiguous
+# (dr1, Lbra·Rket) pieces per s2, one GEMM per (block, s1'), each accumulating into
+# T3's contiguous (s1', sp2, r) column range (α=rec.c, β=1).
 #
 # BATCH-s1 COLLAPSE: the input ket-s1 is a CONTRACTED index and H2 (stepC) treats
 # the bra s1' purely as a spectator (it is folded into stepC's N axis). stepC is
@@ -269,50 +266,51 @@ end
 function _pf_core!(ctx::PartialMatvecContext{T}, T1r) where {T}
     T3buf = zeros(T, ctx.dr2, ctx.chiL_bra, ctx.chiR_ket, ctx.d1, ctx.d2, ctx.n_ham_right_ch)
     T3mat = reshape(T3buf, ctx.dr2, ctx.chiL_bra*ctx.chiR_ket*ctx.d1, ctx.d2, ctx.n_ham_right_ch)
-    buf1_4 = reshape(ctx.buf1, ctx.dr1, ctx.chiL_bra, ctx.chiR_ket, ctx.d2)
+    χ2   = ctx.chiL_bra * ctx.chiR_ket
+    blkC = ctx.dr1 * χ2                                       # one (s2, s1') piece of x2c
+    spC  = blkC * ctx.d2                                      # one s1' slab of x2c (all s2)
+    x2flat = vec(ctx.x2c)
     for m in 1:ctx.n_ham_mid_ch                                         # m = mid channel (processed in isolation)
         # ---- stepB: accumulate EVERY input ket-s1 into x2c (batch-s1 collapse) ----
         _tb = _pf_now()
-        fill!(ctx.x2c, zero(T))                                # small ⇒ cache write, not RAM
+        fill!(ctx.x2c, zero(T))
         any_mass = false
         for s1 in 1:ctx.d1                                     # s1 = H1 KET physical (CONTRACTED)
             recs1 = ctx.step1c[m, s1]
             isempty(recs1) && continue
             any_mass = true
-            cur_lpos = 0; cur_tid = 0
-            for rec in recs1                                   # sorted by (src_pos=lpos, tid)
-                if rec.src_pos != cur_lpos || rec.tid != cur_tid
-                    M1mat = @view T1r[:, rec.src_pos, :, s1]   # (dl1, Lbra·Rket·s2) StridedMatrix (LDA=dl1·n_ham_left_ch)
-                    blk   = view(ctx.templates1, (rec.tid-1)*ctx.blksize1+1 : rec.tid*ctx.blksize1)
-                    if ctx.dl1_fast
-                        BLAS.gemm!('T', 'N', one(T), reshape(blk, ctx.dl1, ctx.dr1), M1mat, zero(T), ctx.buf1)
-                    else
-                        BLAS.gemm!('N', 'N', one(T), reshape(blk, ctx.dr1, ctx.dl1), M1mat, zero(T), ctx.buf1)
-                    end
-                    cur_lpos = rec.src_pos; cur_tid = rec.tid
+            for rec in recs1
+                M1mat = @view T1r[:, rec.src_pos, :, s1]       # (dl1, Lbra·Rket·s2) StridedMatrix (LDA=dl1·n_ham_left_ch)
+                blk   = view(ctx.templates1, (rec.tid-1)*ctx.blksize1+1 : rec.tid*ctx.blksize1)
+                sp1   = rec.out_phys
+                C     = reshape(view(x2flat, (sp1-1)*spC+1 : sp1*spC), ctx.dr1, χ2*ctx.d2)   # x2c[:,:,:,:,sp1]
+                if ctx.dl1_fast
+                    BLAS.gemm!('T', 'N', rec.c, reshape(blk, ctx.dl1, ctx.dr1), M1mat, one(T), C)
+                else
+                    BLAS.gemm!('N', 'N', rec.c, reshape(blk, ctx.dr1, ctx.dl1), M1mat, one(T), C)
                 end
-                sp1 = rec.out_phys
-                @views ctx.x2c[:, :, :, sp1, :] .+= rec.c .* buf1_4   # scale+route into (…, s1'=sp1, …)
             end
         end
         _pf_add!(2, _tb)
         any_mass || continue                                   # no H1 mass into m ⇒ x2c=0 ⇒ stepC=0, skip
 
-        # ---- stepC: drain the FULLY-accumulated x2c into T3 ONCE (s1' folded into N) ----
+        # ---- stepC: drain the FULLY-accumulated x2c into T3 ONCE, one GEMM per (block, s1') ----
         _tc = _pf_now()
         for s2 in 1:ctx.d2                                     # s2 = H2 KET physical
             recs2 = ctx.step2[m, s2]
             isempty(recs2) && continue
-            x2slice = @view ctx.x2c[:, :, :, :, s2]            # (dr1, chiL_bra, chiR_ket, d1) contiguous
-            x2mat   = reshape(x2slice, ctx.dl2, ctx.chiL_bra*ctx.chiR_ket*ctx.d1)   # dl2===dr1
             for rec in recs2
                 blk2 = view(ctx.templates2, (rec.tid-1)*ctx.blksize2+1 : rec.tid*ctx.blksize2)
                 r, sp2 = rec.dst_pos, rec.out_phys             # r = H2 right channel, sp2 = H2 bra s2'
-                Dslice = @view T3mat[:, :, sp2, r]
-                if ctx.dl2_fast
-                    BLAS.gemm!('T', 'N', rec.c, reshape(blk2, ctx.dl2, ctx.dr2), x2mat, one(T), Dslice)
-                else
-                    BLAS.gemm!('N', 'N', rec.c, reshape(blk2, ctx.dr2, ctx.dl2), x2mat, one(T), Dslice)
+                for sp1 in 1:ctx.d1
+                    off    = ((sp1-1)*ctx.d2 + (s2-1)) * blkC
+                    x2mat  = reshape(view(x2flat, off+1 : off+blkC), ctx.dl2, χ2)          # x2c[:,:,:,s2,sp1], dl2===dr1
+                    Dslice = @view T3mat[:, (sp1-1)*χ2+1 : sp1*χ2, sp2, r]
+                    if ctx.dl2_fast
+                        BLAS.gemm!('T', 'N', rec.c, reshape(blk2, ctx.dl2, ctx.dr2), x2mat, one(T), Dslice)
+                    else
+                        BLAS.gemm!('N', 'N', rec.c, reshape(blk2, ctx.dr2, ctx.dl2), x2mat, one(T), Dslice)
+                    end
                 end
             end
         end
