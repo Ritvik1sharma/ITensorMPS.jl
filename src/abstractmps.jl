@@ -1609,6 +1609,24 @@ bond indices is performed. Afterward, tensors
 Either modify in-place with `orthogonalize!` or
 out-of-place with `orthogonalize`.
 """
+# M * R for a bond matrix R(new, old) from factorize. For an aliased site the new bond
+# index takes the old one's place, so the site keeps its index order whichever way the
+# sweep runs (the stock order would put it last, flipping l/r on every other sweep).
+# preserve_bs_output keeps the site aliased; a dense site uses the plain product.
+function _absorb_bond(M::ITensor, R::ITensor)
+    ITensors.has_external_storage(M) || return ITensors.contract(M, R; preserve_bs_output = true)
+    Mw  = ITensors.get_external_storage(M)
+    old = only(commoninds(M, R))
+    new = only(uniqueinds(R, M))
+    d   = SparseBackends.dense_inds(Mw)
+    swap(I) = I == old ? new : I
+    layout = SparseBackends.OutputLayout(sparse = [swap(I) for I in Mw.inds if !(I in d)],
+                                         dense  = [swap(I) for I in Mw.inds if I in d])
+    Cw = SparseBackends.wrapped_contract_aliased(Mw, SparseBackends.wrap_itensor(R; backend = :dense);
+                                                 preserve_bs_output = true, layout = layout)
+    return Cw isa ITensor ? Cw : ITensors._itensor_from_external_storage(Cw)
+end
+
 function orthogonalize!(M::AbstractMPS, j::Int; maxdim = nothing, normalize = nothing,
                         cutoff = nothing)
     # External storage is handled inside `factorize` (ITensors._external_factorize_storage):
@@ -1631,9 +1649,7 @@ function orthogonalize!(M::AbstractMPS, j::Int; maxdim = nothing, normalize = no
         linds = uniqueinds(M[b], M[b + 1])
         L, R = factorize(M[b], linds; tags = ltags, maxdim, cutoff)
         M[b]     = L
-        # preserve_bs_output: plain `*` sends aliased × dense R to the dense-output path;
-        # this keeps the site aliased (dense-tail GEMM). The dense path ignores the kwarg.
-        M[b + 1] = ITensors.contract(M[b + 1], R; preserve_bs_output = true)
+        M[b + 1] = _absorb_bond(M[b + 1], R)
         setleftlim!(M, b)
         if rightlim(M) < leftlim(M) + 2
             setrightlim!(M, leftlim(M) + 2)
@@ -1650,7 +1666,7 @@ function orthogonalize!(M::AbstractMPS, j::Int; maxdim = nothing, normalize = no
         rinds = uniqueinds(M[b + 1], M[b])
         L, R = factorize(M[b + 1], rinds; tags = ltags, maxdim, cutoff)
         M[b + 1] = L
-        M[b]    = ITensors.contract(M[b], R; preserve_bs_output = true)
+        M[b]    = _absorb_bond(M[b], R)
         setrightlim!(M, b + 1)
         if leftlim(M) > rightlim(M) - 2
             setleftlim!(M, rightlim(M) - 2)
