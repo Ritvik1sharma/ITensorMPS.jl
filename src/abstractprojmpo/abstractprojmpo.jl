@@ -53,21 +53,12 @@ end
                  SparseBackends.wrap_itensor(A; backend=:dense)
     Bw = b_ali ? ITensors.get_external_storage(B) :
                  SparseBackends.wrap_itensor(B; backend=:dense)
-    # Compute a dense-inds hint so the output's classification stays
-    # consistent with the aliased input: only the aliased input's dense-tail
-    # Indices go into the output's dense tail; site/link indices from the
-    # dense operand (e.g. H_site's site') get pulled into the sparse prefix.
-    # This avoids cross-region mismatches between subsequent contracts.
-    hint = if a_ali && b_ali
-        Set{ITensors.Index}(SparseBackends.dense_inds(Aw)) ∪
-        Set{ITensors.Index}(SparseBackends.dense_inds(Bw))
-    elseif a_ali
-        Set{ITensors.Index}(SparseBackends.dense_inds(Aw))
-    else
-        Set{ITensors.Index}(SparseBackends.dense_inds(Bw))
-    end
+    # Output layout: only the aliased input's dense indices form the output's dense
+    # block; site/link indices from the dense operand (e.g. H_site's site') go into
+    # the key. This keeps the classification consistent across subsequent contracts.
     Cw = SparseBackends.wrapped_contract_aliased(Aw, Bw;
-        preserve_bs_output=true, output_inds_hint=hint, in_position=in_position)
+        preserve_bs_output=true, in_position=in_position,
+        layout=SparseBackends.dense_from_aliased_operand(Aw, Bw))
     C = Cw isa ITensor ? Cw : ITensors._itensor_from_external_storage(Cw)
     if SparseBackends.ALIASED_TRACE[]
         if ITensors.has_external_storage(C) &&
@@ -563,14 +554,13 @@ function ITensors.contract(P::AbstractProjMPO, v::ITensor; roofline::Bool=false,
                           println("inds(Hv) = ", inds(Hv))
                       end
                       @timeit PROJMPO_TIMER "matvec.sparseH_denseV_$(idx)" begin
-                        # Output order comes from the hardcoded dense-ψ table keyed by
-                        # (bondtype, step); φ is pinned upstream so this is deterministic
-                        # every sweep. Retires _canon_labels_for_next on the dense path
-                        # (next_op no longer passed).
+                        # Output order: the fixed per-position layout for this
+                        # (bondtype, step); φ is pinned upstream so it is deterministic
+                        # every sweep (nothing = stock order, for steps without one).
                         Hv = SparseBackends.contract_aliased_itensor(
                             it, Hv, :aliased, :dense;
                             preserve_bs_output = false,
-                            output_perm = SparseBackends.static_output_perm_dense(_bondtype, idx),
+                            layout = SparseBackends.matvec_dense_layout(_bondtype, idx, it, Hv),
                         )
                       end
                       if debug
