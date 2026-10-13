@@ -861,11 +861,20 @@ function ITensors.contract(
         # required for TEBD on an aliased psi, else s' is demoted to the dense tail
         # and the alias keys collapse.
         alias_hint::Union{Nothing,Symbol}=nothing,
+        # Output layout of every site product A[i] * ψ[i] (replaces alias_hint): a
+        # SparseBackends.OutputLayout, normally written with roles (op, kind, k): op :A
+        # for the MPO site, :B for the ψ site; absent roles are skipped at edge sites, e.g.
+        #   OutputLayout(sparse=[(:B,:l,1), (:B,:r,1), (:A,:sp)],
+        #                dense =[(:B,:l,2), (:B,:r,2), (:A,:r), (:A,:l)])
+        # nothing = stock layout. See SparseBackends.show_roles.
+        layout=nothing,
     )::MPS
     n = length(A)
     n != length(ψ) &&
         throw(DimensionMismatch("lengths of MPO ($n) and MPS ($(length(ψ))) do not match"))
     if n == 1
+        layout === nothing || throw(ArgumentError(
+            "contract(MPO, MPS): a layout is not supported for a one-site chain"))
         return MPS([A[1] * ψ[1]])
     end
     ψ_out = similar(ψ)
@@ -886,7 +895,8 @@ function ITensors.contract(
         denseLinksB=denseLinksB,
         aLeft=aLeft, aRight=aRight,
         bLeft=bLeft, bRight=bRight,
-        alias_hint=alias_hint
+        alias_hint=alias_hint,
+        layout=layout
         )
         ψ_out[i] = Ci
     end
