@@ -1089,7 +1089,11 @@ function ITensors.contract(A::MPO, B::MPO,
                            Abackend::Symbol, Bbackend::Symbol;
                            Cbackend=nothing,
                            denseLinksA::Union{Nothing,Int}=nothing,
-                           denseLinksB::Union{Nothing,Int}=nothing)
+                           denseLinksB::Union{Nothing,Int}=nothing,
+                           # Output layout of every site product A[i] * B[i] (roles: :A for
+                           # A's site, :B for B's); nothing = stock layout. See
+                           # SparseBackends.OutputLayout / show_roles.
+                           layout=nothing)
   #   println("=================== backends ", Abackend, " and ", Bbackend, " ===================")
   N = length(A)
   N == length(B) || throw(DimensionMismatch("MPO lengths don't match"))
@@ -1112,7 +1116,8 @@ function ITensors.contract(A::MPO, B::MPO,
       denseLinksA=denseLinksA,
       denseLinksB=denseLinksB,
       aLeft=aLeft, aRight=aRight,
-      bLeft=bLeft, bRight=bRight
+      bLeft=bLeft, bRight=bRight,
+      layout=layout
     )
     C[i] = Ci
   end
