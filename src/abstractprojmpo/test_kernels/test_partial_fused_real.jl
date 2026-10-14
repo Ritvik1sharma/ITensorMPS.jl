@@ -166,7 +166,7 @@ function main()
     # the Renv leg at an end — so a single GEMM can't emit Hv in φ's order. We
     # therefore reorder Hv → v's index order once at the end. This is a χ²·9
     # tensor (no channel/mult legs), ~16× smaller than the T1 permute we killed,
-    # and a bd-independent static pattern (the analog of static_output_perm_dense
+    # and a bd-independent static pattern (the analog of _STATIC_OUTPUT_PERM_DENSE
     # not being all-identity). With it, order(Hv)==order(v) — Krylov-consistent.
     partial_full(vv) = permute(noprime(R * matvec_partial_fused(ctx, pin_T1(vv); out_inds=oi)),
                                inds(vv)...)
