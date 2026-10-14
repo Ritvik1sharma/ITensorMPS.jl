@@ -1121,6 +1121,8 @@ function ITensors.contract(A::MPO, B::MPO,
     )
     C[i] = Ci
   end
+  # an aliased product: fuse each bond's key link strands, order the dense blocks
+  any(T -> _aliased_wrap(T) !== nothing, C) && canonicalize_aliased_bonds!(C)
   return C
 end
 
