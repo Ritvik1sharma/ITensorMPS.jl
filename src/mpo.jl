@@ -855,13 +855,7 @@ function ITensors.contract(
         Cbackend=nothing,
         denseLinksA::Union{Nothing,Int}=nothing,
         denseLinksB::Union{Nothing,Int}=nothing,
-        # Output axis-classification policy, forwarded to contract_and_fuse_links.
-        # nothing = historical behaviour. :preserve_prefix keeps the aliased
-        # operand's prefix and promotes the dense operand's site index into it --
-        # required for TEBD on an aliased psi, else s' is demoted to the dense tail
-        # and the alias keys collapse.
-        alias_hint::Union{Nothing,Symbol}=nothing,
-        # Output layout of every site product A[i] * ψ[i] (replaces alias_hint): a
+        # Output layout of every site product A[i] * ψ[i]: a
         # SparseBackends.OutputLayout, normally written with roles (op, kind, k): op :A
         # for the MPO site, :B for the ψ site; absent roles are skipped at edge sites, e.g.
         #   OutputLayout(sparse=[(:B,:l,1), (:B,:r,1), (:A,:sp)],
@@ -895,7 +889,6 @@ function ITensors.contract(
         denseLinksB=denseLinksB,
         aLeft=aLeft, aRight=aRight,
         bLeft=bLeft, bRight=bRight,
-        alias_hint=alias_hint,
         layout=layout
         )
         ψ_out[i] = Ci
@@ -1096,8 +1089,7 @@ function ITensors.contract(A::MPO, B::MPO,
                            Abackend::Symbol, Bbackend::Symbol;
                            Cbackend=nothing,
                            denseLinksA::Union{Nothing,Int}=nothing,
-                           denseLinksB::Union{Nothing,Int}=nothing,
-                           kwargs...)
+                           denseLinksB::Union{Nothing,Int}=nothing)
   #   println("=================== backends ", Abackend, " and ", Bbackend, " ===================")
   N = length(A)
   N == length(B) || throw(DimensionMismatch("MPO lengths don't match"))

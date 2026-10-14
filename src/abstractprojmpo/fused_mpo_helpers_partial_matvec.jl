@@ -368,8 +368,8 @@ end
 # Hv in the SAME index order as v — so the wrap-around φ-pinning holds and Krylov
 # iterations don't pay a per-iteration permute — T3 must be emitted in the SAME
 # order the stock step-3 leg produced for this (bondtype, step). Pass that order
-# as `out_inds` (the dispatch reads it from the same static_output_perm_dense
-# machinery the rest of the chain uses); the natural build order is then permuted
+# as `out_inds` (the dispatch reads it from the same _STATIC_OUTPUT_PERM_DENSE
+# table, via SparseBackends.matvec_dense_layout, that the rest of the chain uses); the natural build order is then permuted
 # to it ONCE (a small T3 copy — no 44 GB T2, so still a net win). `out_inds ===
 # nothing` returns the natural build order (correct index SET; use only when the
 # caller does its own downstream reorder).
@@ -408,7 +408,7 @@ end
 
 # ============================================================
 # Target T3 output order = the SAME order the stock step-3 leg emits, read off
-# the STATIC_OUTPUT_PERM_DENSE table's documented (bondtype, 3) layouts (in
+# the _STATIC_OUTPUT_PERM_DENSE table's documented (bondtype, 3) layouts (in
 # SparseBackends/tensor_wrappers_aliased.jl). We use the DECODED role order from
 # that table's `-> T3(...)` comment, mapped onto ctx's index handles — NOT the
 # raw numeric perm (which is relative to the stock kernel's internal labelsC_vec,
