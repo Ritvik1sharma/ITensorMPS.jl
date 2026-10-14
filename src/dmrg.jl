@@ -469,13 +469,22 @@ function dmrg(
             _iph = _dmrg_inner_projmpo(PH)
             use_fused = !(lproj(_iph) isa OneITensor) && !(rproj(_iph) isa OneITensor)
           end
-          # Pin dense φ to the aliased kernel's strided-read layout (only when the operator
-          # is aliased — a dense-H matvec is order-agnostic, so no wasted permute there).
-          # Layout-only ⇒ E unchanged. :standard → [:l,:s2,:r,:s]; :fused → [:l,:r,:s2,:s].
+          # Pin dense φ = ψ[b]·ψ[b+1] to the aliased kernel's strided-read layout (only
+          # when the operator is aliased — a dense-H matvec is order-agnostic, so no wasted
+          # permute there). Layout-only ⇒ E unchanged. The fixed matvec output orders
+          # (SparseBackends._STATIC_OUTPUT_PERM_DENSE) assume exactly this φ order:
+          #   :standard → [link1, s(b+1), link2, s(b)]
+          #   :fused    → [links..., s(b+1), s(b)]
+          # where links = φ's bond links left to right (ψ[b]'s left, ψ[b+1]'s right). At a
+          # chain end φ has one link, which then takes the first link slot.
           if _op_aliased_mpo && !SparseBackends.is_sparse_mps(psi)
             @timeit PROJMPO_TIMER "dmrg.phi_reorder_dense" begin
-              phi = SparseBackends.reorder_to_roles(phi, use_fused ? [:l, :r, :s2, :s] :
-                                                              [:l, :s2, :r, :s])
+              links = ITensors.Index[I for I in (linkind(psi, b - 1), linkind(psi, b + 1))
+                                     if I !== nothing]
+              s, s2 = siteind(psi, b), siteind(psi, b + 1)
+              order = use_fused ? vcat(links, s2, s) :
+                                  vcat(links[1:min(1, end)], s2, links[2:end], s)
+              collect(inds(phi)) == order || (phi = permute(phi, order...))
             end
           end
 
