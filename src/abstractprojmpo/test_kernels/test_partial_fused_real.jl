@@ -23,14 +23,9 @@ println("[BLAS threads pinned to ", BLAS.get_num_threads(), "]")
 include("/home/ritvik/temp/temp/edited_packages/test_sparse_ham/aliased_helpers.jl")
 
 # ---- builders (copied verbatim from test_fused_real.jl) ----
-function sandwich_mpo(P::MPO, H::MPO; output_hint::Symbol=:default)
-    H1    = contract(P'', H', :coo, :dense; Cbackend=output_hint)
-    H_eff = contract(P, H1, :coo, output_hint; Cbackend=output_hint)
-    return replaceprime(H_eff, 3 => 1)
-end
-mulMPO(A::MPO, B::MPO) = replaceprime(contract(A, prime(B, "Site"), :coo, :coo), 2 => 1)
+include(joinpath(@__DIR__, "..", "..", "..", "..", "..", "experiments", "utils", "cotenn_utils.jl"))
 function multiplyVecMPOtoMPO(vec)
-    r = vec[1]; for j in 2:length(vec); r = mulMPO(r, vec[j]); end; r
+    r = vec[1]; for j in 2:length(vec); r = multiply_mpos(r, vec[j]; Abackend = :coo, Bbackend = :coo); end; r
 end
 function clean!(op::MPO; tol=1e-12)
     for j in 1:length(op)
@@ -78,7 +73,7 @@ function main()
     H        = MPO(os, sites)
 
     println("[build aliased PHP]")
-    H_ali = sandwich_mpo(P_sparse, H; output_hint=:aliased)
+    H_ali = sandwich_mpo(P_sparse, H; datastructure = :aliased)
     fuse_sparse_links!(H_ali)
     prepermute_aliased_mpo!(H_ali)
 

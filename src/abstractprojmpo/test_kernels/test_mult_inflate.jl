@@ -23,13 +23,8 @@ include("/home/ritvik/temp/temp/edited_packages/ITensorMPS.jl/src/abstractprojmp
 const PEAK_GFPS = Ref(0.0)   # BLAS ComplexF64 peak (2MNK conv), set in main
 
 # ---- builders (verbatim from test_fused_real.jl) ----
-function sandwich_mpo(P::MPO, H::MPO; output_hint::Symbol=:default)
-    H1    = contract(P'', H', :coo, :dense; Cbackend=output_hint)
-    H_eff = contract(P, H1, :coo, output_hint; Cbackend=output_hint)
-    return replaceprime(H_eff, 3 => 1)
-end
-mulMPO(A::MPO, B::MPO) = replaceprime(contract(A, prime(B, "Site"), :coo, :coo), 2 => 1)
-multiplyVecMPOtoMPO(vec) = (r = vec[1]; for j in 2:length(vec); r = mulMPO(r, vec[j]); end; r)
+include(joinpath(@__DIR__, "..", "..", "..", "..", "..", "experiments", "utils", "cotenn_utils.jl"))
+multiplyVecMPOtoMPO(vec) = (r = vec[1]; for j in 2:length(vec); r = multiply_mpos(r, vec[j]; Abackend = :coo, Bbackend = :coo); end; r)
 function clean!(op::MPO; tol=1e-12)
     for j in 1:length(op)
         T = op[j]; A = array(T)
@@ -168,7 +163,7 @@ end
 # and H2's right. Reuses the real sandwich + product path (no hand-built storage).
 function inflated_aliased_PH(P_sparse::MPO, H_bare::MPO, psi::MPS, mid::Int, M::Int)
     Hpad     = pad_mpo_bonds(H_bare, M, Set([mid-1, mid, mid+1]))
-    Hpad_ali = sandwich_mpo(P_sparse, Hpad; output_hint=:aliased)
+    Hpad_ali = sandwich_mpo(P_sparse, Hpad; datastructure = :aliased)
     fuse_sparse_links!(Hpad_ali); prepermute_aliased_mpo!(Hpad_ali)
     PH = ITensorMPS.ProjMPO(Hpad_ali)
     ITensorMPS.position!(PH, psi, mid)
@@ -195,7 +190,7 @@ function main()
     end
     P_sparse = multiplyVecMPOtoMPO(ConsOps1); H = MPO(os, sites)
     println("[build aliased PHP]")
-    H_ali = sandwich_mpo(P_sparse, H; output_hint=:aliased)
+    H_ali = sandwich_mpo(P_sparse, H; datastructure = :aliased)
     fuse_sparse_links!(H_ali); prepermute_aliased_mpo!(H_ali)
     Random.seed!(42); psi0 = random_mps(sites)
     for j in 1:N; psi0 = replaceprime(ConsOps2[j] * psi0, 1 => 0); normalize!(psi0); end
