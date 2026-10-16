@@ -121,3 +121,6 @@ fuse_aliased_bond_strands!, then order_aliased_dense_blocks!. Non-aliased sites 
 alone. Called by contract(A::MPO, B::MPO, Abackend, Bbackend) on an aliased result.
 """
 canonicalize_aliased_bonds!(H::MPO) = (fuse_aliased_bond_strands!(H); order_aliased_dense_blocks!(H); H)
+
+"""Storage of an MPO / MPS: SparseBackends.footprint of each site, summed over sites."""
+SparseBackends.footprint(M::AbstractMPS) = reduce((a, b) -> map(+, a, b), SparseBackends.footprint.(M))
