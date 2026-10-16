@@ -80,7 +80,7 @@ end
 
 function dmrg(H::MPO, psi0::MPS, sweeps::Sweeps; P::Union{Nothing,MPO}=nothing,
              run_mode::Union{Nothing,Symbol}=nothing,
-             target_energy=nothing, use_early_exit=true, last_sweep_energy=nothing, kwargs...)
+             target_energy=nothing, use_early_exit=true, kwargs...)
   run_mode === nothing || run_mode in (:standard, :fused) ||
     error("dmrg: unknown run_mode=$(run_mode); expected :standard or :fused")
   check_hascommoninds(siteinds, H, psi0)
@@ -105,7 +105,6 @@ function dmrg(H::MPO, psi0::MPS, sweeps::Sweeps; P::Union{Nothing,MPO}=nothing,
     unsupported = [k for k in keys(kwargs) if !(k in supported)]
     isempty(unsupported) || error("dmrg(...; P): factor-core does not support $(unsupported)")
     run_mode === nothing || error("dmrg(...; P): run_mode does not apply to factor-core")
-    last_sweep_energy === nothing || error("dmrg(...; P): factor-core does not support last_sweep_energy")
     all(sw -> noise(sweeps, sw) == 0, 1:nsweep(sweeps)) ||
       error("dmrg(...; P): factor-core does not support noise")
     return dmrg_core_php(H, P, psi0, sweeps; target_energy, use_early_exit, kwargs...)
@@ -333,7 +332,6 @@ function dmrg(
   sweeps::Sweeps;
   target_energy=nothing,
   use_early_exit=true,
-  last_sweep_energy=nothing,
   which_decomp=nothing,
   svd_alg=nothing,
   observer=NoObserver(),
@@ -414,15 +412,7 @@ function dmrg(
   
 
   energy = 0.0
-  # THis is a check to take last energy as a specific value
-  if last_sweep_energy != nothing
-    last_energy = last_sweep_energy
-    if use_early_exit != true
-      error("use_early_exit must be set to true when last_sweep_energy is specified")
-    end
-  else
-    last_energy = 1e10
-  end
+  last_energy = 1e10
 
   early_exit_sweep = -1
   total_truncation_err = 0
@@ -912,12 +902,11 @@ function dmrg(
   noise=default_noise(),
   target_energy=nothing,
   use_early_exit=true,
-  last_sweep_energy=nothing,
   kwargs...,
 )
   # println("Type1 is here -- :: ", cutoff, noise, use_early_exit)
 
-  return dmrg(x1, psi0, _dmrg_sweeps(; nsweeps, maxdim, mindim, cutoff, noise); target_energy, use_early_exit, last_sweep_energy, kwargs...)
+  return dmrg(x1, psi0, _dmrg_sweeps(; nsweeps, maxdim, mindim, cutoff, noise); target_energy, use_early_exit, kwargs...)
 end
 
 function constrained_dmrg(
