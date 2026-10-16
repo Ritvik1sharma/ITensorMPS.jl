@@ -70,8 +70,6 @@ H        = MPO(os, sites)
 
 println("[build aliased PHP]")
 H_ali = sandwich_mpo(P_sparse, H; datastructure = :aliased)
-fuse_sparse_links!(H_ali)
-prepermute_aliased_mpo!(H_ali)
 
 Random.seed!(42)
 psi0 = random_mps(sites)

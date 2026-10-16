@@ -72,8 +72,6 @@ function build_and_report(tstr, d, N, ss)
     println("  projector P  MPO bond dims: ", Pbond, "   (max ", maximum(Pbond), ")")
 
     H_ali = sandwich_mpo(P_sparse, copy(H); datastructure = :aliased)
-    fuse_sparse_links!(H_ali)
-    prepermute_aliased_mpo!(H_ali)
 
     L = length(H_ali)
     println("  --- aliased PHP per-site (Link | Site | mult | n_tmpl blksize) ---")
