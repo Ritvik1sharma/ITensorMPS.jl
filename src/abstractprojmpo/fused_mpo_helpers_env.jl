@@ -176,12 +176,12 @@ end
 
 # Eligible for the fused kernel: the incoming env E is a real 4-leg tensor (NOT the
 # boundary OneITensor scalar) and the site H tensor is a 6-leg aliased bulk tensor.
-# Boundary steps and any non-aliased/dense H fall back to the stock _env_mul chain.
+# Boundary steps and any non-aliased/dense H fall back to one _makeL!/_makeR! step.
 _fused_env_eligible(E, H_site) =
     (E isa ITensor) && _is_aliased_itensor(H_site) && length(inds(H_site)) == 6
 
-# One LEFT env step, LR[ll] → LR[ll+1] (mirrors _makeL!'s stock body; swaps the
-# aliased H·dag(ψ')·ψ chain for the fused kernel when eligible).
+# One LEFT env step, LR[ll] → LR[ll+1]: the fused kernel when eligible, else one
+# _makeL! step (which reads LR[P.lpos]).
 function _fused_makeL!(P::ProjMPO, psi::MPS, k::Int; roofline::Bool=false, run_label::String="?")
     ll = P.lpos
     if ll ≥ k
@@ -195,11 +195,8 @@ function _fused_makeL!(P::ProjMPO, psi::MPS, k::Int; roofline::Bool=false, run_l
             # E=LR[ll]=L, H[ll+1], psi_site=psi[ll+1], neighbor=psi[ll] (identifies psi's new bond)
             L = _fused_sparse_env_contract(L, H_site, psi[ll + 1], psi[ll])
         else
-            _keep = _is_aliased_itensor(H_site) && _is_aliased_itensor(psi[ll + 1])
-            L = _env_mul(L, H_site, _keep)
-            L = _env_mul(L, dag(prime(psi[ll + 1])), _keep)
-            L = _env_mul(L, psi[ll + 1], _keep)
-            L = _reorder_env_for_aliased(L, _keep, _is_aliased_itensor(H_site))
+            P.lpos = ll
+            L = _makeL!(P, psi, ll + 1)
         end
         P.LR[ll + 1] = L
         roofline && _record_env_footprint(ll + 1, L, run_label)
@@ -209,7 +206,8 @@ function _fused_makeL!(P::ProjMPO, psi::MPS, k::Int; roofline::Bool=false, run_l
     return L
 end
 
-# One RIGHT env step, LR[rl] → LR[rl-1] (mirrors _makeR!'s stock body).
+# One RIGHT env step, LR[rl] → LR[rl-1]: the fused kernel when eligible, else one
+# _makeR! step (which reads LR[P.rpos]).
 function _fused_makeR!(P::ProjMPO, psi::MPS, k::Int; roofline::Bool=false, run_label::String="?")
     rl = P.rpos
     if rl ≤ k
@@ -224,11 +222,8 @@ function _fused_makeR!(P::ProjMPO, psi::MPS, k::Int; roofline::Bool=false, run_l
             # E=LR[rl]=R, H[rl-1], psi_site=psi[rl-1], neighbor=psi[rl]
             R = _fused_sparse_env_contract(R, H_site, psi[rl - 1], psi[rl])
         else
-            _keep = _is_aliased_itensor(H_site) && _is_aliased_itensor(psi[rl - 1])
-            R = _env_mul(R, H_site, _keep)
-            R = _env_mul(dag(prime(psi[rl - 1])), R, _keep)
-            R = _env_mul(psi[rl - 1], R, _keep)
-            R = _reorder_env_for_aliased(R, _keep, _is_aliased_itensor(H_site))
+            P.rpos = rl
+            R = _makeR!(P, psi, rl - 1)
         end
         P.LR[rl - 1] = R
         roofline && _record_env_footprint(rl - 1, R, run_label)
