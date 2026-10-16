@@ -24,7 +24,7 @@ function permute(
   return M̃
 end
 
-function dmrg(H::MPO, psi0::MPS, sweeps::Sweeps; target_energy=nothing, use_early_exit=true, last_sweep_energy=nothing, kwargs...)
+function dmrg(H::MPO, psi0::MPS, sweeps::Sweeps; target_energy=nothing, use_early_exit=true, kwargs...)
   check_hascommoninds(siteinds, H, psi0)
   check_hascommoninds(siteinds, H, psi0')
   # Permute the indices to have a better memory layout
@@ -188,7 +188,6 @@ function dmrg(
   sweeps::Sweeps;
   target_energy=nothing,
   use_early_exit=true,
-  last_sweep_energy=nothing,
   which_decomp=nothing,
   svd_alg=nothing,
   observer=NoObserver(),
@@ -232,15 +231,7 @@ function dmrg(
   end
   PH = position!(PH, psi, 1)
   energy = 0.0
-  # THis is a check to take last energy as a specific value
-  if last_sweep_energy != nothing
-    last_energy = last_sweep_energy
-    if use_early_exit != true
-      error("use_early_exit must be set to true when last_sweep_energy is specified")
-    end
-  else
-    last_energy = 1e10
-  end
+  last_energy = 1e10
 
   early_exit_sweep = -1
   total_truncation_err = 0
@@ -677,12 +668,11 @@ function dmrg(
   noise=default_noise(),
   target_energy=nothing,
   use_early_exit=true,
-  last_sweep_energy=nothing,
   kwargs...,
 )
   # println("Type1 is here -- :: ", cutoff, noise, use_early_exit)
 
-  return dmrg(x1, psi0, _dmrg_sweeps(; nsweeps, maxdim, mindim, cutoff, noise); target_energy, use_early_exit, last_sweep_energy, kwargs...)
+  return dmrg(x1, psi0, _dmrg_sweeps(; nsweeps, maxdim, mindim, cutoff, noise); target_energy, use_early_exit, kwargs...)
 end
 
 function constrained_dmrg(
