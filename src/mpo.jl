@@ -821,10 +821,111 @@ function ITensors.contract(alg::Algorithm"naive", A::MPO, B::MPO; kwargs...)
     return _contract(alg, A, B; kwargs...)
 end
 
+# Exact MPO × MPO product (is_ctn_compression = true): no orthogonalization and no SVD;
+# each bond's links of A and B are combined into one index. Ported from the
+# SparseBackends ITensorMPS fork so dense callers can build the exact operator here too.
+function bond_common_links(T1, T2, b)
+  c = ITensors.commoninds(T1, T2)
+  L = ITensors.Index[
+    I for I in c if ITensors.hastags(I,"Link") && ITensors.hastags(I,"l=$b")
+  ]
+  out = ITensors.Index[]
+  used = Set{UInt64}()
+  for I1 in ITensors.inds(T1)
+    (ITensors.hastags(I1,"Link") && ITensors.hastags(I1,"l=$b")) || continue
+    key = ITensors.noprime(I1)
+    # find matching link in T2 with same noprime
+    I2 = findfirst(J -> ITensors.hastags(J,"Link") &&
+                        ITensors.hastags(J,"l=$b") &&
+                        ITensors.noprime(J) == key, ITensors.inds(T2))
+    I2 === nothing && continue
+    # dedup by unprimed id (not perfect but works)
+    uid = ITensors.id(key)
+    uid in used && continue
+    push!(out, I1)
+    push!(out, ITensors.inds(T2)[I2])
+    push!(used, uid)
+  end
+  return out  # oriented pairs: [A1,B1,A2,B2,...]
+end
+
+function collapse_all_bonds!(W::MPO; debug::Bool=false)
+  N = length(W)
+
+  for b in 1:(N - 1)
+    T1 = W[b]
+    T2 = W[b + 1]
+
+    # raw common links (your function)
+    L_raw = bond_common_links(T1, T2, b)
+
+    # keep/drop: we want UNIQUE link legs by unprimed identity
+    seen = Set{ITensors.Index}()
+    L = ITensors.Index[]
+    for I in L_raw
+      key = ITensors.noprime(I)
+      if !(key in seen)
+        push!(L, I)
+        push!(seen, key)
+      end
+    end
+
+    length(L) ≤ 1 && continue
+
+    # Guard: each chosen link should appear exactly once in each tensor.
+    # If not, you likely have repeated indices inside a tensor → don't collapse here.
+    for I in L
+      c1 = count(J -> ITensors.noprime(J) == ITensors.noprime(I), ITensors.inds(T1))
+      c2 = count(J -> ITensors.noprime(J) == ITensors.noprime(I), ITensors.inds(T2))
+      if c1 != 1 || c2 != 1
+        debug && println("b=$b: skipping collapse; repeated link found for ", I, " counts(T1,T2)=($c1,$c2)")
+        L = ITensors.Index[]  # mark empty
+        break
+      end
+    end
+    isempty(L) && continue
+
+    debug && println("b=$b, collapsing unique common link inds: ", L)
+
+    # IMPORTANT: just build combiner directly on the ACTUAL indices (priming included).
+    # No need for Lu/replaceinds gymnastics.
+    C = ITensors.combiner(L...; tags=("Link,l=$b"))
+
+    debug && (println("Collapsing bond $b with $(length(L)) common links..."); println(T1); println(C))
+
+    T1c = T1 * C
+
+    # Push inverse into the right tensor.
+    # dag(C) carries (combined', L'...) so map its L legs to T2's exact L legs.
+    U0 = ITensors.dag(C)
+
+    # Build mapping from U0's L legs (by unprimed identity) to the exact L in T2
+    Uinds = collect(ITensors.inds(U0))
+    from = ITensors.Index[]
+    to   = ITensors.Index[]
+    for Li in L
+      key = ITensors.noprime(Li)
+      j = findfirst(I -> (ITensors.noprime(I) == key), Uinds)
+      j === nothing && continue
+      push!(from, Uinds[j])
+      push!(to, Li)
+    end
+    U = isempty(from) ? U0 : ITensors.replaceinds(U0, from .=> to)
+
+    T2c = U * T2
+
+    W[b]   = T1c
+    W[b+1] = T2c
+  end
+  return W
+end
+
 function ITensors.contract(
         ::Algorithm"zipup",
         A::MPO,
         B::MPO;
+        is_ctn_compression::Bool = false,
+        debug::Bool = false,
         cutoff = 1.0e-14,
         maxdim = maxlinkdim(A) * maxlinkdim(B),
         mindim = 1,
@@ -840,8 +941,10 @@ function ITensors.contract(
         throw(DimensionMismatch("lengths of MPOs A ($N) and B ($(length(B))) do not match"))
     # Special case for a single site
     N == 1 && return MPO([A[1] * B[1]])
-    A = orthogonalize(A, 1)
-    B = orthogonalize(B, 1)
+    if !is_ctn_compression
+        A = orthogonalize(A, 1)
+        B = orthogonalize(B, 1)
+    end
     A = sim(linkinds, A)
     sA = siteinds(uniqueinds, A, B)
     sB = siteinds(uniqueinds, B, A)
@@ -850,6 +953,10 @@ function ITensors.contract(
     R = ITensor(true)
     for i in 1:(N - 2)
         RABᵢ = R * A[i] * B[i]
+        if is_ctn_compression
+            C[i] = RABᵢ
+            continue
+        end
         left_inds = [sA[i]..., sB[i]..., lCᵢ...]
         C[i], R = factorize(
             RABᵢ,
@@ -864,6 +971,12 @@ function ITensors.contract(
         lCᵢ = dag(commoninds(C[i], R))
     end
     i = N - 1
+    if is_ctn_compression
+        C[i] = R * A[i] * B[i]
+        C[i + 1] = A[i + 1] * B[i + 1]
+        collapse_all_bonds!(C; debug)
+        return C
+    end
     RABᵢ = R * A[i] * B[i] * A[i + 1] * B[i + 1]
     left_inds = [sA[i]..., sB[i]..., lCᵢ...]
     C[N - 1], C[N] = factorize(
