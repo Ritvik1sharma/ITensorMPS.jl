@@ -109,25 +109,31 @@ function core_php_energy(psi::MPS, H::MPO)
 end
 
 """
-    dmrg_core_php(H::MPO, P::MPO, psi0::MPS; nsweeps, maxdim, cutoff=1e-12,
-                  eigsolve_krylovdim=30, eigsolve_tol=1e-12, outputlevel=1)
-        -> (energy, psi)
+    dmrg_core_php(H::MPO, P::MPO, psi0::MPS, sweeps::Sweeps; target_energy=nothing,
+                  use_early_exit=true, eigsolve_krylovdim=3, eigsolve_tol=1e-14,
+                  eigsolve_maxiter=1, outputlevel=1)
+        -> (energy, psi, sweeps_run, truncation_error)
 
 Core-mode DMRG (factor-core; diagonal AND flip P). `psi0` is the aliased ψ = P·core.
-Optimizes the core with metric I (no M), keeping ψ aliased. Returns the physical ground
-energy and the optimized aliased ψ. This is the ONLY aliased-ψ + dense-H method (the
-Path-B run modes were removed); reachable via `dmrg(H, psi0; P=P, nsweeps, maxdim)` for
-an aliased ψ, or called directly.
+Optimizes the core with metric I (no M), keeping ψ aliased. Uses each sweep's maxdim /
+mindim / cutoff, stops by the same rules as the generic dmrg loop (energy change < 1e-4
+with `use_early_exit`, then `target_energy`), and returns what that loop returns. The
+eigsolve defaults are the generic loop's. Reached via `dmrg(H, psi0; P=P, ...)` for an
+aliased ψ, or called directly.
 """
-function dmrg_core_php(H::MPO, P::MPO, psi0::MPS; nsweeps::Int, maxdim::Int, mindim::Int=1,
-                       cutoff::Real=1e-12, eigsolve_krylovdim::Int=30,
-                       eigsolve_tol::Real=1e-12, outputlevel::Int=1)
+function dmrg_core_php(H::MPO, P::MPO, psi0::MPS, sweeps::Sweeps; target_energy=nothing,
+                       use_early_exit=true, eigsolve_krylovdim::Int=3, eigsolve_tol::Real=1e-14,
+                       eigsolve_maxiter::Int=1, outputlevel::Int=1)
     N = length(psi0); psi = copy(psi0)
     cpm = CoreProjMPO(H, P; nsite=2)
     _core_canonicalize!(psi)
     local E = core_php_energy(psi, H)
     outputlevel > 0 && @printf("[core_php] init  E=%.10f\n", E)
-    for sw in 1:nsweeps
+    last_energy = 1e10
+    early_exit_sweep = -1
+    total_truncation_err = 0.0
+    for sw in 1:nsweep(sweeps)
+        maxtruncerr = 0.0
         t_sweep = @elapsed for (b, ha) in sweepnext(N)
             position!(cpm, psi, b)
             # eigsolve vector = the 2-site CHANNEL-FREE core. Build the aliased window
@@ -148,15 +154,30 @@ function dmrg_core_php(H::MPO, P::MPO, psi0::MPS; nsweeps::Int, maxdim::Int, min
                           ITensors.get_external_storage(psi[b+1]))
             f(core) = (SparseBackends.write_core_window!(w_buf, core, wmap); product(cpm, phi_buf))
             _, vecs = eigsolve(f, core0, 1, :SR; ishermitian=true,
-                               krylovdim=eigsolve_krylovdim, tol=eigsolve_tol)
+                               krylovdim=eigsolve_krylovdim, tol=eigsolve_tol,
+                               maxiter=eigsolve_maxiter)
             # dense core → the dense-core write-back (aliased_replacebond!)
-            replacebond!(psi, b, vecs[1]; ortho = ha == 1 ? "left" : "right",
-                         maxdim, mindim, cutoff)
+            spec = replacebond!(psi, b, vecs[1]; ortho = ha == 1 ? "left" : "right",
+                                maxdim=maxdim(sweeps, sw), mindim=mindim(sweeps, sw),
+                                cutoff=cutoff(sweeps, sw))
+            maxtruncerr = max(maxtruncerr, spec.truncerr)
         end
+        total_truncation_err = max(total_truncation_err, maxtruncerr)
         E = core_php_energy(psi, H)
         mbd = maximum(j -> maximum(ITensors.dim, ITensors.get_external_storage(psi[j]).inds), 1:N)
         outputlevel > 0 && @printf("[core_php] sweep %2d  E=%.10f  t_sweep=%.3fs  maxbond=%d\n",
                                    sw, E, t_sweep, mbd)
+        # the generic dmrg loop's stopping rules, in the same order
+        early_exit_sweep = sw
+        if use_early_exit && (last_energy - E < 1e-4)
+            outputlevel >= 1 && println("Energy change less than 1e-4, stopping DMRG")
+            break
+        end
+        last_energy = E
+        if target_energy !== nothing && (E - target_energy) < 1e-4
+            println("Target energy reached in sweeps ", sw)
+            break
+        end
     end
-    return E, psi
+    return E, psi, early_exit_sweep, total_truncation_err
 end
