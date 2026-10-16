@@ -83,7 +83,7 @@ function main()
     _ns = parse(Int, get(ENV, "BENCH_NSWEEPS", "4"))
     println("[dmrg to reach bd=$_md, nsweeps=$_ns]")
     res = dmrg(H_ali, psi0; nsweeps=_ns, maxdim=_md, mindim=_md, cutoff=1e-12,
-               outputlevel=1, use_early_exit=false)
+               outputlevel=1, use_early_exit=false, run_mode=:standard)
     psi = res[2]
 
     PH = ITensorMPS.ProjMPO(H_ali)

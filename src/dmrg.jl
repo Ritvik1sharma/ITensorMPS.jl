@@ -79,9 +79,9 @@ function permute(
 end
 
 function dmrg(H::MPO, psi0::MPS, sweeps::Sweeps; P::Union{Nothing,MPO}=nothing,
-             run_mode::Symbol=:standard,
+             run_mode::Union{Nothing,Symbol}=nothing,
              target_energy=nothing, use_early_exit=true, last_sweep_energy=nothing, kwargs...)
-  run_mode in (:standard, :fused) ||
+  run_mode === nothing || run_mode in (:standard, :fused) ||
     error("dmrg: unknown run_mode=$(run_mode); expected :standard or :fused")
   check_hascommoninds(siteinds, H, psi0)
   check_hascommoninds(siteinds, H, psi0')
@@ -99,13 +99,16 @@ function dmrg(H::MPO, psi0::MPS, sweeps::Sweeps; P::Union{Nothing,MPO}=nothing,
     P !== nothing ||
       error("dmrg: an aliased ψ (is_sparse_mps) requires the constraint MPO `P=` for the " *
             "factor-core method; the Path-B aliased-ψ path has been removed.")
-    n = nsweep(sweeps)
-    # factor-core takes scalar dims (no per-sweep schedule yet) → use the final sweep's.
-    return dmrg_core_php(H, P, psi0;
-      nsweeps=n, maxdim=maxdim(sweeps, n), mindim=mindim(sweeps, n), cutoff=cutoff(sweeps, n),
-      eigsolve_krylovdim=get(kwargs, :eigsolve_krylovdim, 30),
-      eigsolve_tol=get(kwargs, :eigsolve_tol, 1e-12),
-      outputlevel=get(kwargs, :outputlevel, 1))
+    # factor-core honours the sweep schedule, early exit, target_energy, outputlevel and the
+    # eigsolve krylovdim / tol / maxiter; anything else is an error, not ignored
+    supported = (:eigsolve_krylovdim, :eigsolve_tol, :eigsolve_maxiter, :outputlevel)
+    unsupported = [k for k in keys(kwargs) if !(k in supported)]
+    isempty(unsupported) || error("dmrg(...; P): factor-core does not support $(unsupported)")
+    run_mode === nothing || error("dmrg(...; P): run_mode does not apply to factor-core")
+    last_sweep_energy === nothing || error("dmrg(...; P): factor-core does not support last_sweep_energy")
+    all(sw -> noise(sweeps, sw) == 0, 1:nsweep(sweeps)) ||
+      error("dmrg(...; P): factor-core does not support noise")
+    return dmrg_core_php(H, P, psi0, sweeps; target_energy, use_early_exit, kwargs...)
   end
   # run_mode threads into the single generic loop below. For an aliased-PHP operator +
   # dense ψ it selects the matvec (and, later, env) kernel at the dispatch points; for a
@@ -353,10 +356,18 @@ function dmrg(
   # Tags env-footprint/permute-profile records with the run name ("DENSE"/"ALIASED"/…).
   run_label::String="?",
   # Kernel selector for the aliased-PHP + dense-ψ case (inert otherwise): :standard =
-  # stock per-leg aliased matvec (byte-identical to before); :fused = partial-fused
-  # matvec (matvec_partial_fused_full) on bulk bonds. See dispatch points below.
-  run_mode::Symbol=:standard
+  # stock per-leg aliased matvec; :fused = partial-fused matvec (matvec_partial_fused_full)
+  # on bulk bonds. See dispatch points below. Default: :fused for an aliased P†HP, else
+  # :standard.
+  run_mode::Union{Nothing,Symbol}=nothing
 )
+  # decided from the operator as passed in, before any disk swap below
+  if run_mode === nothing
+    PH isa ProjMPOSum && any(_dmrg_op_is_aliased, terms(PH)) &&
+      error("dmrg: a sum of operators with an aliased term has no fused kernel; " *
+            "pass run_mode = :standard")
+    run_mode = _dmrg_op_is_aliased(PH) ? :fused : :standard
+  end
   run_mode in (:standard, :fused) ||
     error("dmrg: unknown run_mode=$(run_mode); expected :standard or :fused")
   SparseBackends.ALIASED_TRACE[] = debug   # route this call's debug flag to the aliased trace prints

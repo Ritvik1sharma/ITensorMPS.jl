@@ -77,7 +77,7 @@ for j in 1:N; psi0 = replaceprime(ConsOps2[j] * psi0, 1 => 0); normalize!(psi0);
 
 println("[dmrg to reach bd=40]")
 res = dmrg(H_ali, psi0; nsweeps=4, maxdim=40, mindim=40, cutoff=1e-12,
-           outputlevel=1, use_early_exit=false)
+           outputlevel=1, use_early_exit=false, run_mode=:standard)
 psi = res[2]
 
 # ---- position a fresh ProjMPO at the middle bond ----
