@@ -865,13 +865,10 @@ function _makeL!(P::AbstractProjMPO, psi::MPS, k::Int; debug=false, roofline::Bo
                 println("\n--- Error ---")
                 rethrow(e)
             end
-            # L = L * dag(prime(psi[ll + 1]))
-            # Reorder so "FusedSparse" axes go last → matvec kernel sees
-            # canonical layout and skips its per-call permute_B. (Skipped for the
-            # both-aliased env inside _reorder_env_for_aliased.)
-            L = _reorder_env_for_aliased(L, _keep_env, _is_aliased_itensor(H_site))
+            # No reorder: the dense ψ'† step appends bra' last, so L already comes out
+            # as [ket, dense-H, key, bra'], the order the matvec reads.
             if _env_dbg && _ENV_DBG_COUNT[] <= _env_dbg_max
-                println("  L (after × dag(psi') × psi, post-reorder) FINAL inds = ", inds(L))
+                println("  L (after × dag(psi') × psi) FINAL inds = ", inds(L))
                 println("    P.LR[", ll+1, "] stored.  external? ",
                         ITensors.has_external_storage(L))
             end
@@ -949,10 +946,14 @@ function _makeR!(P::AbstractProjMPO, psi::MPS, k::Int; debug=false, roofline::Bo
             if _env_dbg2 && _ENV_DBG_COUNT[] <= _env_dbg2_max
                 println("  R (after × H_site) inds = ", inds(R))
             end
-            R = _env_mul(dag(prime(psi[rl - 1])), R, _keep_env)
-            R = _reorder_env_for_aliased(R, _keep_env, _is_aliased_itensor(H_site))
+            # Aliased H with a dense env: ψ'† goes last, so ITensors appends its bra'
+            # at the end and R comes out as [ket, dense-H, key, bra'], the order the
+            # matvec reads (no reorder). Dense-H and both-aliased envs keep ψ'† first.
+            R = (!_keep_env && _is_aliased_itensor(H_site)) ?
+                _env_mul(R, dag(prime(psi[rl - 1])), _keep_env) :
+                _env_mul(dag(prime(psi[rl - 1])), R, _keep_env)
             if _env_dbg2 && _ENV_DBG_COUNT[] <= _env_dbg2_max
-                println("  R (after × dag(psi') × psi, post-reorder) FINAL inds = ", inds(R))
+                println("  R (after × dag(psi') × psi) FINAL inds = ", inds(R))
             end
         end
         P.LR[rl - 1] = R
