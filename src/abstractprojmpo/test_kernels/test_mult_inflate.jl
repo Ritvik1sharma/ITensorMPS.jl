@@ -164,7 +164,6 @@ end
 function inflated_aliased_PH(P_sparse::MPO, H_bare::MPO, psi::MPS, mid::Int, M::Int)
     Hpad     = pad_mpo_bonds(H_bare, M, Set([mid-1, mid, mid+1]))
     Hpad_ali = sandwich_mpo(P_sparse, Hpad; datastructure = :aliased)
-    fuse_sparse_links!(Hpad_ali); prepermute_aliased_mpo!(Hpad_ali)
     PH = ITensorMPS.ProjMPO(Hpad_ali)
     ITensorMPS.position!(PH, psi, mid)
     return PH
@@ -191,7 +190,6 @@ function main()
     P_sparse = multiplyVecMPOtoMPO(ConsOps1); H = MPO(os, sites)
     println("[build aliased PHP]")
     H_ali = sandwich_mpo(P_sparse, H; datastructure = :aliased)
-    fuse_sparse_links!(H_ali); prepermute_aliased_mpo!(H_ali)
     Random.seed!(42); psi0 = random_mps(sites)
     for j in 1:N; psi0 = replaceprime(ConsOps2[j] * psi0, 1 => 0); normalize!(psi0); end
     println("[dmrg to reach bd=40]")

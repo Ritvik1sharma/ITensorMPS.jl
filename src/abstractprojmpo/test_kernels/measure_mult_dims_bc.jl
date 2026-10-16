@@ -77,8 +77,6 @@ function build_php(N, spin_sector, closed::Bool)
     H = MPO(os, sites)
 
     H_ali = sandwich_mpo(P_sparse, H; datastructure = :aliased)
-    fuse_sparse_links!(H_ali)
-    prepermute_aliased_mpo!(H_ali)
     return H_ali, P_sparse
 end
 
