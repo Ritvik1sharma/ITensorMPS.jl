@@ -19,28 +19,6 @@ include(joinpath(@__DIR__, "..", "..", "..", "..", "..", "experiments", "utils",
 function multiplyVecMPOtoMPO(vec)
     r = vec[1]; for j in 2:length(vec); r = multiply_mpos(r, vec[j]; Abackend = :coo, Bbackend = :coo); end; r
 end
-function clean!(op::MPO; tol=1e-12)
-    for j in 1:length(op)
-        T = op[j]; A = array(T)
-        for i in eachindex(A)
-            v = A[i]
-            if     abs(v)       < tol; A[i] =  0.0
-            elseif abs(v - 1.0) < tol; A[i] =  1.0
-            elseif abs(v + 1.0) < tol; A[i] = -1.0
-            elseif abs(v - 0.5) < tol; A[i] =  0.5
-            elseif abs(v + 0.5) < tol; A[i] = -0.5
-            elseif abs(v - 1.0im) < tol; A[i] =  1.0im
-            elseif abs(v + 1.0im) < tol; A[i] = -1.0im
-            elseif abs(v - 0.5im) < tol; A[i] =  0.5im
-            elseif abs(v + 0.5im) < tol; A[i] = -0.5im
-            elseif abs(v + 2.0)   < tol; A[i] = -2.0
-            elseif abs(v - 2.0)   < tol; A[i] =  2.0
-            end
-        end
-        op[j] = ITensor(A, inds(T)...)
-    end
-    return op
-end
 
 # Build the aliased PHP for a given boundary condition and return it.
 function build_php(N, spin_sector, closed::Bool)
@@ -70,7 +48,7 @@ function build_php(N, spin_sector, closed::Bool)
         temp = OpSum()
         temp += 0.5,             "Id",           ps[1], "Id",           ps[2], "Id",           ps[3], "Id",           ps[4]
         temp += spin_sector*0.5, "exp(i*pi*Sy)", ps[1], "exp(i*pi*Sx)", ps[2], "exp(i*pi*Sx)", ps[3], "exp(i*pi*Sy)", ps[4]
-        op = MPO(temp, sites, ps); clean!(op)
+        op = MPO(temp, sites, ps; clean = true)
         push!(ConsOps1, op)
     end
     P_sparse = multiplyVecMPOtoMPO(ConsOps1)
