@@ -27,28 +27,6 @@ include(joinpath(@__DIR__, "..", "..", "..", "..", "..", "experiments", "utils",
 function multiplyVecMPOtoMPO(vec)
     r = vec[1]; for j in 2:length(vec); r = multiply_mpos(r, vec[j]; Abackend = :coo, Bbackend = :coo); end; r
 end
-function clean!(op::MPO; tol=1e-12)
-    for j in 1:length(op)
-        T = op[j]; A = array(T)
-        for i in eachindex(A)
-            v = A[i]
-            if     abs(v)       < tol; A[i] =  0.0
-            elseif abs(v - 1.0) < tol; A[i] =  1.0
-            elseif abs(v + 1.0) < tol; A[i] = -1.0
-            elseif abs(v - 0.5) < tol; A[i] =  0.5
-            elseif abs(v + 0.5) < tol; A[i] = -0.5
-            elseif abs(v - 1.0im) < tol; A[i] =  1.0im
-            elseif abs(v + 1.0im) < tol; A[i] = -1.0im
-            elseif abs(v - 0.5im) < tol; A[i] =  0.5im
-            elseif abs(v + 0.5im) < tol; A[i] = -0.5im
-            elseif abs(v + 2.0)   < tol; A[i] = -2.0
-            elseif abs(v - 2.0)   < tol; A[i] =  2.0
-            end
-        end
-        op[j] = ITensor(A, inds(T)...)
-    end
-    return op
-end
 
 function main()
     N = 12; spin_sector = 1.0
@@ -66,7 +44,7 @@ function main()
     end
     ConsOps1 = MPO[]; ConsOps2 = MPO[]
     for j in 1:N
-        op = MPO(os2[j], sites, [2j-1, 2j, 2j+1, 2j+2]); clean!(op)
+        op = MPO(os2[j], sites, [2j-1, 2j, 2j+1, 2j+2]; clean = true)
         push!(ConsOps1, op); push!(ConsOps2, MPO(os2[j], sites))
     end
     P_sparse = multiplyVecMPOtoMPO(ConsOps1)

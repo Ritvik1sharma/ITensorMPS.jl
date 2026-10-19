@@ -23,28 +23,6 @@ include(joinpath(@__DIR__, "..", "..", "..", "..", "..", "experiments", "utils",
 function multiplyVecMPOtoMPO(vec)
     r = vec[1]; for j in 2:length(vec); r = multiply_mpos(r, vec[j]; Abackend = :coo, Bbackend = :coo); end; r
 end
-function clean!(op::MPO; tol=1e-12)
-    for j in 1:length(op)
-        T = op[j]; A = array(T)
-        for i in eachindex(A)
-            v = A[i]
-            if     abs(v)         < tol; A[i] =  0.0
-            elseif abs(v - 1.0)   < tol; A[i] =  1.0
-            elseif abs(v + 1.0)   < tol; A[i] = -1.0
-            elseif abs(v - 0.5)   < tol; A[i] =  0.5
-            elseif abs(v + 0.5)   < tol; A[i] = -0.5
-            elseif abs(v - 1.0im) < tol; A[i] =  1.0im
-            elseif abs(v + 1.0im) < tol; A[i] = -1.0im
-            elseif abs(v - 0.5im) < tol; A[i] =  0.5im
-            elseif abs(v + 0.5im) < tol; A[i] = -0.5im
-            elseif abs(v + 2.0)   < tol; A[i] = -2.0
-            elseif abs(v - 2.0)   < tol; A[i] =  2.0
-            end
-        end
-        op[j] = ITensor(A, inds(T)...)
-    end
-    return op
-end
 
 function build_and_report(tstr, d, N, ss)
     states = 2N + 2
@@ -60,7 +38,7 @@ function build_and_report(tstr, d, N, ss)
         temp = OpSum()
         temp += 0.5,    "Id",2j-1,"Id",2j,"Id",2j+1,"Id",2j+2
         temp += ss*0.5, "exp(i*pi*Sy)",2j-1,"exp(i*pi*Sx)",2j,"exp(i*pi*Sx)",2j+1,"exp(i*pi*Sy)",2j+2
-        op = MPO(temp, sites, [2j-1, 2j, 2j+1, 2j+2]); clean!(op)
+        op = MPO(temp, sites, [2j-1, 2j, 2j+1, 2j+2]; clean = true)
         push!(ConsOps1, op)
     end
     P_sparse = multiplyVecMPOtoMPO(ConsOps1)

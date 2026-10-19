@@ -25,28 +25,6 @@ const PEAK_GFPS = Ref(0.0)   # BLAS ComplexF64 peak (2MNK conv), set in main
 # ---- builders (verbatim from test_fused_real.jl) ----
 include(joinpath(@__DIR__, "..", "..", "..", "..", "..", "experiments", "utils", "cotenn_utils.jl"))
 multiplyVecMPOtoMPO(vec) = (r = vec[1]; for j in 2:length(vec); r = multiply_mpos(r, vec[j]; Abackend = :coo, Bbackend = :coo); end; r)
-function clean!(op::MPO; tol=1e-12)
-    for j in 1:length(op)
-        T = op[j]; A = array(T)
-        for i in eachindex(A)
-            v = A[i]
-            if     abs(v)         < tol; A[i] =  0.0
-            elseif abs(v - 1.0)   < tol; A[i] =  1.0
-            elseif abs(v + 1.0)   < tol; A[i] = -1.0
-            elseif abs(v - 0.5)   < tol; A[i] =  0.5
-            elseif abs(v + 0.5)   < tol; A[i] = -0.5
-            elseif abs(v - 1.0im) < tol; A[i] =  1.0im
-            elseif abs(v + 1.0im) < tol; A[i] = -1.0im
-            elseif abs(v - 0.5im) < tol; A[i] =  0.5im
-            elseif abs(v + 0.5im) < tol; A[i] = -0.5im
-            elseif abs(v + 2.0)   < tol; A[i] = -2.0
-            elseif abs(v - 2.0)   < tol; A[i] =  2.0
-            end
-        end
-        op[j] = ITensor(A, inds(T)...)
-    end
-    return op
-end
 
 # ---- logical (dl x dr) template matrix in native orientation ----
 function template_matrix(templates, blksize, tid, dl, dr, dl_fast)
@@ -184,7 +162,7 @@ function main()
     end
     ConsOps1 = MPO[]; ConsOps2 = MPO[]
     for j in 1:N
-        op = MPO(os2[j], sites, [2j-1, 2j, 2j+1, 2j+2]); clean!(op); push!(ConsOps1, op)
+        op = MPO(os2[j], sites, [2j-1, 2j, 2j+1, 2j+2]; clean = true); push!(ConsOps1, op)
         push!(ConsOps2, MPO(os2[j], sites))
     end
     P_sparse = multiplyVecMPOtoMPO(ConsOps1); H = MPO(os, sites)
