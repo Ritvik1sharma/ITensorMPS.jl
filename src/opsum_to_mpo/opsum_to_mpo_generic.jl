@@ -241,6 +241,26 @@ function sortmergeterms(os::OpSum{C}) where {C}
   return os
 end
 
+# MPO(...; clean = true): snap entries within tol of 0, ±1, ±1/2, ±im, ±im/2, ±2 to the exact
+# value, so roundoff from evaluating ops (e.g. "exp(im * pi * Sy)") leaves no near-zero entries
+function clean_mpo!(op::MPO; tol = 1e-12)
+  for j in 1:length(op)
+    T = op[j]
+    A = ITensors.array(T)
+    for i in eachindex(A)
+      v = A[i]
+      for target in (0.0, 1.0, -1.0, 0.5, -0.5, 1.0im, -1.0im, 0.5im, -0.5im, 2.0, -2.0)
+        if abs(v - target) < tol
+          A[i] = target
+          break
+        end
+      end
+    end
+    op[j] = ITensors.ITensor(A, ITensors.inds(T)...)
+  end
+  return op
+end
+
 """
     MPO(os::OpSum, sites::Vector{<:Index}; splitblocks=true, kwargs...)
     MPO(eltype::Type{<:Number}, os::OpSum, sites::Vector{<:Index}; splitblocks=true, kwargs...)
@@ -287,21 +307,33 @@ H = MPO(Float32,os,sites)
 H = MPO(os,sites; splitblocks=false)
 ```
 """
-function MPO(os::OpSum, sites::Vector{<:Index}, support::Union{Vector{Int64}, Nothing}=nothing; splitblocks=true, kwargs...)::MPO
+# sites without QNs: `support` restricts the MPO to those sites (bond 1 elsewhere), `clean`
+# snaps roundoff entries to exact values (clean_mpo!)
+function MPO(os::OpSum, sites::Vector{Index{Int}}, support::Union{Vector{Int64}, Nothing}=nothing; splitblocks=true, clean::Bool=false, kwargs...)::MPO
   length(terms(os)) == 0 && error("OpSum has no terms")  
 
   os = deepcopy(os)
   os = sorteachterm(os, sites)
   os = sortmergeterms(os)
 
-  if hasqns(sites[1])
-    return qn_svdMPO(os, sites; kwargs...)
-  end
   M = svdMPO(os, sites, support; kwargs...)
   if splitblocks
     M = ITensors.splitblocks(linkinds, M)
   end
+  clean && clean_mpo!(M)
   return M
+end
+
+# sites with QNs: no support or clean (qn_svdMPO builds the full-chain MPO); splitblocks is
+# accepted and not applied here, as in upstream ITensorMPS
+function MPO(os::OpSum, sites::Vector{Index{ITensors.QNBlocks}}; splitblocks=true, kwargs...)::MPO
+  length(terms(os)) == 0 && error("OpSum has no terms")  
+
+  os = deepcopy(os)
+  os = sorteachterm(os, sites)
+  os = sortmergeterms(os)
+
+  return qn_svdMPO(os, sites; kwargs...)
 end
 
 function MPO(elt::Type{<:Number}, os::OpSum, sites::Vector{<:Index}; kwargs...)
