@@ -1592,6 +1592,18 @@ function sum(ψ⃗::Vector{T}; kwargs...) where {T <: AbstractMPS}
     return +(ψ⃗...; kwargs...)
 end
 
+# M * R, where R comes from `factorize` on M's neighbour (orthogonalize! in both directions,
+# truncate!). A hook per storage: a site with external storage goes to its storage's
+# `_absorb_bond` method in SparseBackends (block-sparse: blocksparse/factorize.jl; aliased:
+# aliased/shared/absorb.jl, aliased/sector_split/absorb.jl), which keeps the site's index
+# order and key/dense split with R's new bond indices in the old ones' slots. A dense site is
+# the plain product.
+function _absorb_bond(M::ITensor, R::ITensor)
+    ITensors.has_external_storage(M) || return ITensors.contract(M, R)
+    Mw = ITensors.get_external_storage(M)
+    return SparseBackends._absorb_bond(SparseBackends.rep(Mw), Mw, M, R)
+end
+
 """
     orthogonalize!(M::MPS, j::Int; kwargs...)
     orthogonalize(M::MPS, j::Int; kwargs...)
@@ -1609,24 +1621,6 @@ bond indices is performed. Afterward, tensors
 Either modify in-place with `orthogonalize!` or
 out-of-place with `orthogonalize`.
 """
-# M * R for a bond matrix R(new, old) from factorize. For an aliased site the new bond
-# index takes the old one's place, so the site keeps its index order whichever way the
-# sweep runs (the stock order would put it last, flipping l/r on every other sweep).
-# preserve_bs_output keeps the site aliased; a dense site uses the plain product.
-function _absorb_bond(M::ITensor, R::ITensor)
-    ITensors.has_external_storage(M) || return ITensors.contract(M, R; preserve_bs_output = true)
-    Mw  = ITensors.get_external_storage(M)
-    old = only(commoninds(M, R))
-    new = only(uniqueinds(R, M))
-    d   = SparseBackends.dense_inds(Mw)
-    swap(I) = I == old ? new : I
-    layout = SparseBackends.OutputLayout(sparse = [swap(I) for I in Mw.inds if !(I in d)],
-                                         dense  = [swap(I) for I in Mw.inds if I in d])
-    Cw = SparseBackends.wrapped_contract_aliased(Mw, SparseBackends.wrap_itensor(R; backend = :dense);
-                                                 preserve_bs_output = true, layout = layout)
-    return Cw isa ITensor ? Cw : ITensors._itensor_from_external_storage(Cw)
-end
-
 function orthogonalize!(M::AbstractMPS, j::Int; maxdim = nothing, normalize = nothing,
                         cutoff = nothing)
     # External storage is handled inside `factorize` (ITensors._external_factorize_storage):
@@ -1666,7 +1660,7 @@ function orthogonalize!(M::AbstractMPS, j::Int; maxdim = nothing, normalize = no
         rinds = uniqueinds(M[b + 1], M[b])
         L, R = factorize(M[b + 1], rinds; tags = ltags, maxdim, cutoff)
         M[b + 1] = L
-        M[b]    = _absorb_bond(M[b], R)
+        M[b] = _absorb_bond(M[b], R)
         setrightlim!(M, b + 1)
         if leftlim(M) > rightlim(M) - 2
             setleftlim!(M, rightlim(M) - 2)
@@ -1725,13 +1719,15 @@ function truncate!(
     # truncations controlled
     orthogonalize!(M, last(site_range))
 
-    # Perform truncations in a right-to-left sweep
+    # Perform truncations in a right-to-left sweep. `factorize` with svd (L = U, R = S * V)
+    # makes the same svd call for a dense site and reaches the external-storage hooks.
     for j in reverse((first(site_range) + 1):last(site_range))
         rinds = uniqueinds(M[j], M[j - 1])
         ltags = tags(commonind(M[j], M[j - 1]))
-        U, S, V, spec = svd(M[j], rinds; lefttags = ltags, kwargs...)
-        M[j] = U
-        M[j - 1] *= (S * V)
+        L, R, spec = factorize(M[j], rinds; which_decomp = "svd", ortho = "left", tags = ltags,
+                               kwargs...)
+        M[j] = L
+        M[j - 1] = _absorb_bond(M[j - 1], R)
         setrightlim!(M, j)
         callback(; link = (j => j - 1), truncation_error = spec.truncerr)
     end
