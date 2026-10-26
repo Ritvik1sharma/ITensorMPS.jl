@@ -69,7 +69,7 @@ using PrecompileTools: @setup_workload, @compile_workload
 
             # THE expensive one: COO MPO x dense MPS -> AliasedBlockSparse, i.e.
             # psi = P * core. This is where a cold process spent >15 min in
-            # jl_compile_codeinst_now for wrapped_contract_aliased.
+            # jl_compile_codeinst_now for the aliased-output wrapped_contract.
             ali = contract(H, psi, :coo, :dense; Cbackend = :aliased)
             try
                 orthogonalize!(ali, 1; maxdim = 8)

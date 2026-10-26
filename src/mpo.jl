@@ -847,8 +847,13 @@ ITensors.contract(ψ::MPS, A::MPO; kwargs...) = contract(A, ψ; kwargs...)
 import Base.StackTraces: stacktrace
 
 
+# `A` is an MPO, or one constrained TEBD layer `(gate = MPO, gauges = [(X_1, X_1^-1), ...,
+# (X_{N-1}, X_{N-1}^-1)])` for an aliased ψ = P·core (tebd_utils `build_tebd_mpo_layers(...; P,
+# datastructure = :aliased)`). For the layer, site i is contracted as `(gate = gate[i], gauges =
+# (X_{i-1}, X_i^-1))` by the gauged kernel (SparseBackends `contract_aliased_gauged.jl`): X_{i-1} on
+# the left bond, X_i^-1 on the right one, so the result is gate·ψ in P·core form in one pass.
 function ITensors.contract(
-        A::MPO,
+        A::Union{MPO,NamedTuple{(:gate, :gauges)}},
         ψ::MPS,
         Abackend,
         Bbackend;
@@ -863,28 +868,33 @@ function ITensors.contract(
         # nothing = stock layout. See SparseBackends.show_roles.
         layout=nothing,
     )::MPS
-    n = length(A)
+    G = A isa MPO ? A : A.gate
+    n = length(G)
     n != length(ψ) &&
         throw(DimensionMismatch("lengths of MPO ($n) and MPS ($(length(ψ))) do not match"))
+    A isa MPO || length(A.gauges) == n - 1 ||
+        throw(DimensionMismatch("contract: $(length(A.gauges)) gauges for $n sites"))
     if n == 1
         layout === nothing || throw(ArgumentError(
             "contract(MPO, MPS): a layout is not supported for a one-site chain"))
-        return MPS([A[1] * ψ[1]])
+        return MPS([G[1] * ψ[1]])
     end
     ψ_out = similar(ψ)
 
-    any(i -> isempty(i), siteinds(commoninds, A, ψ)) &&
+    any(i -> isempty(i), siteinds(commoninds, G, ψ)) &&
         error("In `contract(A::MPO, x::MPS)`, `A` and `x` must share a set of site indices")
     
     bondmap = SparseBackends.BondMap()
     for i in 1:n
         # println("abstractmps.jl: Contracting site $i / $N")
-        aLeft  = (i == 1) ? ITensors.Index[] : _mpo_bond_links(A, i-1, i)
-        aRight = (i == n) ? ITensors.Index[] : _mpo_bond_links(A, i,   i+1)
+        aLeft  = (i == 1) ? ITensors.Index[] : _mpo_bond_links(G, i-1, i)
+        aRight = (i == n) ? ITensors.Index[] : _mpo_bond_links(G, i,   i+1)
         bLeft  = (i == 1) ? ITensors.Index[] : _mps_bond_links(ψ, i-1, i)
         bRight = (i == n) ? ITensors.Index[] : _mps_bond_links(ψ, i,   i+1)
+        Ai = A isa MPO ? A[i] :
+             (gate = G[i], gauges = (i == 1 ? nothing : A.gauges[i-1][1], i == n ? nothing : A.gauges[i][2]))
         Ci, bondmap = SparseBackends.top_level_contract(
-        A[i], ψ[i], Abackend, Bbackend, Cbackend, bondmap;
+        Ai, ψ[i], Abackend, Bbackend, Cbackend, bondmap;
         denseLinksA=denseLinksA,
         denseLinksB=denseLinksB,
         aLeft=aLeft, aRight=aRight,

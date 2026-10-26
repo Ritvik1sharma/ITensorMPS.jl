@@ -4,7 +4,7 @@ import Serialization
 using TimerOutputs: TimerOutput, @timeit, reset_timer!, print_timer
 
 # Aliased-aware multiply: if at least one input has WrappedAliasedBlockSparse
-# storage, route through wrapped_contract_aliased with preserve_bs_output=true
+# storage, route through SparseBackends.contract(Aw, Bw; preserve_bs_output=true)
 # so the result stays aliased (the default `*` path would densify). Otherwise
 # fall back to the normal `*`. Mirrors `contract_preserve_bs` for BS psi.
 # Used inside _makeL!/_makeR! and the matvec path.
@@ -56,7 +56,7 @@ end
     # Output layout: only the aliased input's dense indices form the output's dense
     # block; site/link indices from the dense operand (e.g. H_site's site') go into
     # the key. This keeps the classification consistent across subsequent contracts.
-    Cw = SparseBackends.wrapped_contract_aliased(Aw, Bw;
+    Cw = SparseBackends.contract(Aw, Bw;
         preserve_bs_output=true, in_position=in_position,
         layout=SparseBackends.dense_from_aliased_operand(Aw, Bw))
     C = Cw isa ITensor ? Cw : ITensors._itensor_from_external_storage(Cw)
