@@ -244,6 +244,8 @@ function build_MPO_with_support!(
   N = length(H)
   dual = support === nothing
   supp = dual ? nothing : Set(support)
+  # a site between the first and last support site (a gap included) carries the channel
+  in_span = n -> dual || (minimum(support) <= n <= maximum(support))
 
   # Rank from SVD only
   tdim_of = n -> size(Vs[n], 2)
@@ -257,7 +259,7 @@ function build_MPO_with_support!(
     max(tdim_of(b - 1), 1)
   else
     left, right = b - 1, b
-    ((left in supp) || (right in supp)) ? max(tdim_of(left), 1) : 1
+    (in_span(left) || in_span(right)) ? max(tdim_of(left), 1) : 1
   end
 
   # Fix: make N+1 link indices; internal bond between sites b and b+1 has tag "Link,l=b".
@@ -281,7 +283,7 @@ function build_MPO_with_support!(
   function site_tensor(n, ll, rl)
     ValT = infer_valtype(n)
 
-    if !dual && !(n in supp)
+    if !in_span(n)
       idM = zeros(ValT, dim(ll), dim(rl))
       idM[1, 1] = one(ValT)
       return itensor(idM, ll, rl) * computeSiteProd(sites, Prod([Op("Id", n)]))

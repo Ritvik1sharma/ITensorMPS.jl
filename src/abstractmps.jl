@@ -1605,6 +1605,20 @@ function _absorb_bond(M::ITensor, R::ITensor)
 end
 
 """
+    drop_zero_blocks!(M::AbstractMPS) -> M
+
+Each site of `M` without the blocks of its external storage that are exactly zero
+(`ITensors.drop_zero_blocks`; exact, the state is unchanged). Errors on a site without external
+storage. Opt-in: products, factorize and truncate! keep such blocks.
+"""
+function drop_zero_blocks!(M::AbstractMPS)
+    for j in eachindex(M)
+        M[j] = ITensors.drop_zero_blocks(M[j])
+    end
+    return M
+end
+
+"""
     orthogonalize!(M::MPS, j::Int; kwargs...)
     orthogonalize(M::MPS, j::Int; kwargs...)
 

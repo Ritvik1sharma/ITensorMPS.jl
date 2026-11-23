@@ -98,6 +98,7 @@ export
   random_mpo,
   truncate,
   truncate!,
+  drop_zero_blocks!,
   unique_siteind,
   unique_siteinds,
   # mps.jl
